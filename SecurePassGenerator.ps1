@@ -20,7 +20,7 @@
 
 .NOTES
     File Name      : SecurePassGenerator.ps1
-    Version        : 1.0
+    Version        : 1.1
     Author         : onlyalex1984
     Created        : March 2025
     Last Modified  : March 2025
@@ -29,8 +29,496 @@
 #>
 
 # Configuration
-$script:Version = "1.0"
+$script:Version = "1.1"
 $script:ScriptDisplayName = "SecurePassGenerator"
+
+# Password Links History Collection
+$script:PasswordLinks = New-Object System.Collections.ArrayList
+
+# Password Link Model class
+class PasswordLinkModel {
+    [string]$Url
+    [DateTime]$CreatedAt
+    [System.Security.SecureString]$Password
+    [bool]$IsExpired = $false  # New property to track expiration status
+
+    PasswordLinkModel([string]$url, [System.Security.SecureString]$password) {
+        $this.Url = $url
+        $this.CreatedAt = Get-Date
+        $this.Password = $password
+    }
+    
+    # Method to extract token from URL
+    [string] GetToken() {
+        # Extract token from URL (e.g., https://pwpush.com/p/abcdef123456)
+        # More flexible pattern to match different URL formats
+        if ($this.Url -match '(?:https?://)?(?:www\.)?pwpush\.com/p/([a-zA-Z0-9_-]+)') {
+            $token = $matches[1]
+            return $token
+        }
+        
+        # Log the failure for debugging with null check
+        if ($global:controls -and $global:controls.LogOutput) {
+            $global:controls.LogOutput.AppendText("Failed to extract token from URL: $($this.Url)`n")
+        }
+        return ""
+    }
+}
+
+# Function to show password links history in a popup window
+function Show-PasswordLinksHistory {
+    # Create a new window for the password links history
+    $linksWindow = New-Object System.Windows.Window
+    $linksWindow.Title = "Password Links History"
+    $linksWindow.Width = 600
+    $linksWindow.Height = 400
+    $linksWindow.WindowStartupLocation = "CenterScreen"
+    $linksWindow.ResizeMode = "CanResize"
+    $linksWindow.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(245, 245, 245))
+    
+    # Create a grid for the content
+    $grid = New-Object System.Windows.Controls.Grid
+    $grid.Margin = New-Object System.Windows.Thickness(15)
+    
+    # Define row definitions
+    $row1 = New-Object System.Windows.Controls.RowDefinition
+    $row1.Height = [System.Windows.GridLength]::Auto
+    $row2 = New-Object System.Windows.Controls.RowDefinition
+    $row2.Height = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+    $row3 = New-Object System.Windows.Controls.RowDefinition
+    $row3.Height = [System.Windows.GridLength]::Auto
+    $grid.RowDefinitions.Add($row1)
+    $grid.RowDefinitions.Add($row2)
+    $grid.RowDefinitions.Add($row3)
+    
+    # Add a title
+    $titleBlock = New-Object System.Windows.Controls.TextBlock
+    $titleBlock.Text = "Password Links - Current Session"
+    $titleBlock.FontWeight = "Bold"
+    $titleBlock.FontSize = 14
+    $titleBlock.Margin = New-Object System.Windows.Thickness(0, 0, 0, 10)
+    [System.Windows.Controls.Grid]::SetRow($titleBlock, 0)
+    $grid.Children.Add($titleBlock)
+    
+    # Create a ListView for the links
+    $listView = New-Object System.Windows.Controls.ListView
+    $listView.Margin = New-Object System.Windows.Thickness(0, 0, 0, 10)
+    [System.Windows.Controls.Grid]::SetRow($listView, 1)
+    
+    # Create GridView columns
+    $gridView = New-Object System.Windows.Controls.GridView
+    
+    # Time column
+    $timeColumn = New-Object System.Windows.Controls.GridViewColumn
+    $timeColumn.Header = "Time"
+    $timeColumn.Width = 120
+    $timeBinding = New-Object System.Windows.Data.Binding("CreatedAt")
+    $timeBinding.StringFormat = "HH:mm:ss"
+    $timeColumn.DisplayMemberBinding = $timeBinding
+    $gridView.Columns.Add($timeColumn)
+    
+    # URL column with truncation
+    $urlColumn = New-Object System.Windows.Controls.GridViewColumn
+    $urlColumn.Header = "URL"
+    $urlColumn.Width = 180
+    
+    # Create proper IValueConverter implementation for URL truncation
+    Add-Type -TypeDefinition @"
+    using System;
+    using System.Windows.Data;
+    using System.Globalization;
+
+    public class UrlTruncateConverter : IValueConverter
+    {
+        public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            string url = value as string;
+            if (string.IsNullOrEmpty(url))
+                return string.Empty;
+                
+            // Extract token from URL (e.g., https://pwpush.com/p/abcdef123456)
+            if (url.Contains("/p/"))
+            {
+                string[] parts = url.Split(new string[] { "/p/" }, StringSplitOptions.None);
+                if (parts.Length > 1)
+                {
+                    return "pwpush.com/p/" + parts[1];
+                }
+            }
+            
+            // Fallback if URL doesn't match expected format
+            if (url.Length > 30)
+                return url.Substring(0, 27) + "...";
+                
+            return url;
+        }
+
+        public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            return value;
+        }
+    }
+"@ -ReferencedAssemblies PresentationFramework
+
+    # Create an instance of the converter
+    $urlTruncateConverter = New-Object UrlTruncateConverter
+    
+    # Create binding with converter
+    $urlBinding = New-Object System.Windows.Data.Binding("Url")
+    $urlBinding.Converter = $urlTruncateConverter
+    $urlColumn.DisplayMemberBinding = $urlBinding
+    
+    $gridView.Columns.Add($urlColumn)
+    
+    # Status column
+    $statusColumn = New-Object System.Windows.Controls.GridViewColumn
+    $statusColumn.Header = "Status"
+    $statusColumn.Width = 80
+    
+    # Create proper IValueConverter implementation for status text
+    Add-Type -TypeDefinition @"
+    using System;
+    using System.Windows.Data;
+    using System.Globalization;
+
+    public class StatusToTextConverter : IValueConverter
+    {
+        public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            bool isExpired = false;
+            if (value is bool)
+            {
+                isExpired = (bool)value;
+            }
+            
+            if (isExpired)
+                return "Expired";
+            else
+                return "Active";
+        }
+
+        public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            return value as string == "Expired";
+        }
+    }
+"@ -ReferencedAssemblies PresentationFramework
+
+    # Create proper IValueConverter implementation for status color
+    Add-Type -TypeDefinition @"
+    using System;
+    using System.Windows.Data;
+    using System.Windows.Media;
+    using System.Globalization;
+
+    public class StatusToColorConverter : IValueConverter
+    {
+        public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            bool isExpired = false;
+            if (value is bool)
+            {
+                isExpired = (bool)value;
+            }
+            
+            if (isExpired)
+                return new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(220, 53, 69)); // Red for expired
+            else
+                return new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(40, 167, 69)); // Green for active
+        }
+
+        public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            return null;
+        }
+    }
+"@ -ReferencedAssemblies PresentationFramework, PresentationCore, WindowsBase
+
+    # Create instances of the converters
+    $statusToTextConverter = New-Object StatusToTextConverter
+    $statusToColorConverter = New-Object StatusToColorConverter
+    
+    # Create a factory for the status column cells
+    $statusFactory = New-Object System.Windows.FrameworkElementFactory([System.Windows.Controls.TextBlock])
+    $statusBinding = New-Object System.Windows.Data.Binding("IsExpired")
+    $statusBinding.Converter = $statusToTextConverter
+    $statusFactory.SetBinding([System.Windows.Controls.TextBlock]::TextProperty, $statusBinding)
+    
+    # Set color based on status
+    $colorBinding = New-Object System.Windows.Data.Binding("IsExpired")
+    $colorBinding.Converter = $statusToColorConverter
+    $statusFactory.SetBinding([System.Windows.Controls.TextBlock]::ForegroundProperty, $colorBinding)
+    
+    # Create the DataTemplate for the status column
+    $statusTemplate = New-Object System.Windows.DataTemplate
+    $statusTemplate.VisualTree = $statusFactory
+    $statusColumn.CellTemplate = $statusTemplate
+    
+    $gridView.Columns.Add($statusColumn)
+    
+    # Actions column
+    $actionsColumn = New-Object System.Windows.Controls.GridViewColumn
+    $actionsColumn.Header = "Actions"
+    $actionsColumn.Width = 180
+    
+    # Create a factory for the actions column cells
+    $actionsFactory = New-Object System.Windows.FrameworkElementFactory([System.Windows.Controls.StackPanel])
+    $actionsFactory.SetValue([System.Windows.Controls.StackPanel]::OrientationProperty, [System.Windows.Controls.Orientation]::Horizontal)
+    
+    # Create Copy button
+    $copyButtonFactory = New-Object System.Windows.FrameworkElementFactory([System.Windows.Controls.Button])
+    $copyButtonFactory.SetValue([System.Windows.Controls.Button]::ContentProperty, "Copy")
+    $copyButtonFactory.SetValue([System.Windows.Controls.Button]::MarginProperty, (New-Object System.Windows.Thickness(0, 0, 5, 0)))
+    $copyButtonFactory.SetValue([System.Windows.Controls.Button]::WidthProperty, [System.Windows.Controls.Button]::WidthProperty.DefaultMetadata.DefaultValue)
+    $copyButtonFactory.SetValue([System.Windows.Controls.Button]::HeightProperty, [System.Windows.Controls.Button]::HeightProperty.DefaultMetadata.DefaultValue)
+    $copyButtonFactory.SetValue([System.Windows.Controls.Button]::BackgroundProperty, (New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 123, 255))))
+    $copyButtonFactory.SetValue([System.Windows.Controls.Button]::ForegroundProperty, (New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))))
+    
+    # Create proper IValueConverter implementation for inverting boolean values
+    Add-Type -TypeDefinition @"
+    using System;
+    using System.Windows.Data;
+    using System.Globalization;
+
+    public class InverseBoolConverter : IValueConverter
+    {
+        public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            if (value is bool)
+            {
+                bool boolValue = (bool)value;
+                return !boolValue;
+            }
+            return false;
+        }
+
+        public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            if (value is bool)
+            {
+                bool boolValue = (bool)value;
+                return !boolValue;
+            }
+            return false;
+        }
+    }
+"@ -ReferencedAssemblies PresentationFramework, PresentationCore, WindowsBase
+
+    # Create an instance of the converter
+    $inverseBoolConverter = New-Object InverseBoolConverter
+    
+    # Add IsEnabled binding to disable button when password is expired
+    $isEnabledBinding = New-Object System.Windows.Data.Binding("IsExpired")
+    $isEnabledBinding.Converter = $inverseBoolConverter
+    $copyButtonFactory.SetBinding([System.Windows.Controls.Button]::IsEnabledProperty, $isEnabledBinding)
+    
+    $copyButtonFactory.AddHandler([System.Windows.Controls.Button]::ClickEvent, [System.Windows.RoutedEventHandler]{
+        param($buttonSender, $e)
+        $item = $buttonSender.DataContext
+        try {
+            [System.Windows.Forms.Clipboard]::SetText($item.Url)
+            # Add null check before calling AppendText
+            if ($global:controls -and $global:controls.LogOutput) {
+                $global:controls.LogOutput.AppendText("Link copied to clipboard`n")
+            }
+        }
+        catch {
+            # Safely access Exception.Message with a fallback message if it's null
+            $errorMessage = if ($_.Exception -and $_.Exception.Message) { $_.Exception.Message } else { "Unknown error" }
+            # Add null check before calling AppendText
+            if ($global:controls -and $global:controls.LogOutput) {
+                $global:controls.LogOutput.AppendText("Error copying link: $errorMessage`n")
+            }
+        }
+    })
+    $actionsFactory.AppendChild($copyButtonFactory)
+    
+    # Create Browse button
+    $browseButtonFactory = New-Object System.Windows.FrameworkElementFactory([System.Windows.Controls.Button])
+    $browseButtonFactory.SetValue([System.Windows.Controls.Button]::ContentProperty, "Browse")
+    $browseButtonFactory.SetValue([System.Windows.Controls.Button]::MarginProperty, (New-Object System.Windows.Thickness(0, 0, 5, 0)))
+    $browseButtonFactory.SetValue([System.Windows.Controls.Button]::WidthProperty, [System.Windows.Controls.Button]::WidthProperty.DefaultMetadata.DefaultValue)
+    $browseButtonFactory.SetValue([System.Windows.Controls.Button]::HeightProperty, [System.Windows.Controls.Button]::HeightProperty.DefaultMetadata.DefaultValue)
+    $browseButtonFactory.SetValue([System.Windows.Controls.Button]::BackgroundProperty, (New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 123, 255))))
+    $browseButtonFactory.SetValue([System.Windows.Controls.Button]::ForegroundProperty, (New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))))
+    
+    # Add IsEnabled binding to disable browse button when password is expired
+    $browseIsEnabledBinding = New-Object System.Windows.Data.Binding("IsExpired")
+    $browseIsEnabledBinding.Converter = $inverseBoolConverter
+    $browseButtonFactory.SetBinding([System.Windows.Controls.Button]::IsEnabledProperty, $browseIsEnabledBinding)
+    
+    $browseButtonFactory.AddHandler([System.Windows.Controls.Button]::ClickEvent, [System.Windows.RoutedEventHandler]{
+        param($buttonSender, $e)
+        $item = $buttonSender.DataContext
+        try {
+            Start-Process $item.Url
+            # Add null check before calling AppendText
+            if ($global:controls -and $global:controls.LogOutput) {
+                $global:controls.LogOutput.AppendText("Opening link in browser`n")
+            }
+        }
+        catch {
+            # Safely access Exception.Message with a fallback message if it's null
+            $errorMessage = if ($_.Exception -and $_.Exception.Message) { $_.Exception.Message } else { "Unknown error" }
+            # Add null check before calling AppendText
+            if ($global:controls -and $global:controls.LogOutput) {
+                $global:controls.LogOutput.AppendText("Error opening link: $errorMessage`n")
+            }
+        }
+    })
+    $actionsFactory.AppendChild($browseButtonFactory)
+    
+    # Create Expire button
+    $expireButtonFactory = New-Object System.Windows.FrameworkElementFactory([System.Windows.Controls.Button])
+    $expireButtonFactory.SetValue([System.Windows.Controls.Button]::ContentProperty, "Expire")
+    $expireButtonFactory.SetValue([System.Windows.Controls.Button]::WidthProperty, [System.Windows.Controls.Button]::WidthProperty.DefaultMetadata.DefaultValue)
+    $expireButtonFactory.SetValue([System.Windows.Controls.Button]::HeightProperty, [System.Windows.Controls.Button]::HeightProperty.DefaultMetadata.DefaultValue)
+    $expireButtonFactory.SetValue([System.Windows.Controls.Button]::BackgroundProperty, (New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(220, 53, 69)))) # Red color
+    $expireButtonFactory.SetValue([System.Windows.Controls.Button]::ForegroundProperty, (New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))))
+    
+    # Add IsEnabled binding to disable expire button when password is expired
+    $expireIsEnabledBinding = New-Object System.Windows.Data.Binding("IsExpired")
+    $expireIsEnabledBinding.Converter = $inverseBoolConverter
+    $expireButtonFactory.SetBinding([System.Windows.Controls.Button]::IsEnabledProperty, $expireIsEnabledBinding)
+    
+$expireButtonFactory.AddHandler([System.Windows.Controls.Button]::ClickEvent, [System.Windows.RoutedEventHandler]{
+        param($buttonSender, $e)
+        $item = $buttonSender.DataContext
+        
+        # Skip if already expired
+        if ($item.IsExpired) {
+            return
+        }
+        
+        # Extract token from URL
+        $token = $item.GetToken()
+        
+        if (-not $token) {
+            # Add null check before calling AppendText
+            if ($global:controls -and $global:controls.LogOutput) {
+                $global:controls.LogOutput.AppendText("Error: Could not extract token from URL`n")
+            }
+            return
+        }
+        
+        # Show confirmation dialog
+        $confirmResult = [System.Windows.MessageBox]::Show(
+            "Are you sure you want to expire this password? This action cannot be undone.",
+            "Confirm Password Expiration",
+            [System.Windows.MessageBoxButton]::YesNo,
+            [System.Windows.MessageBoxImage]::Warning
+        )
+        
+        if ($confirmResult -eq [System.Windows.MessageBoxResult]::Yes) {
+            # Call the expire function
+            # Add null check before calling AppendText
+            if ($global:controls -and $global:controls.LogOutput) {
+                $global:controls.LogOutput.AppendText("Attempting to expire password with token: $token...`n")
+            }
+            $result = Remove-Password -Token $token
+            
+            # Add null check before calling AppendText
+            if ($global:controls -and $global:controls.LogOutput) {
+                $global:controls.LogOutput.AppendText($result.Log + "`n")
+            }
+            
+            if ($result.Success) {
+                # Update the item's expired status
+                $item.IsExpired = $true
+                
+                # Update the UI to reflect the expired status
+                # Add null check before calling AppendText
+                if ($global:controls -and $global:controls.LogOutput) {
+                    $global:controls.LogOutput.AppendText("Password link expired successfully`n")
+                    $global:controls.LogOutput.AppendText("Status: Expired`n")
+                }
+                
+                # Find the parent StackPanel that contains all buttons
+                $stackPanel = $buttonSender.Parent
+                if ($null -ne $stackPanel) {
+                    # Update all buttons in the StackPanel
+                    foreach ($child in $stackPanel.Children) {
+                        if ($child -is [System.Windows.Controls.Button]) {
+                            # Force UI update for each button
+                            $child.GetBindingExpression([System.Windows.Controls.Button]::IsEnabledProperty).UpdateTarget()
+                        }
+                    }
+                }
+                
+                # Find the ListView and refresh it
+                $listView = $buttonSender.FindName("listView")
+                if ($null -eq $listView) {
+                    # Try to find the ListView by traversing up the visual tree
+                    $parent = $buttonSender.Parent
+                    while ($null -ne $parent -and $null -eq $listView) {
+                        if ($parent -is [System.Windows.Controls.ListView]) {
+                            $listView = $parent
+                        }
+                        $parent = [System.Windows.Media.VisualTreeHelper]::GetParent($parent)
+                    }
+                }
+                
+                # Refresh the ListView to show updated status
+                if ($null -ne $listView) {
+                    $listView.Items.Refresh()
+                }
+                
+                # Force a more comprehensive UI update
+                [System.Windows.Data.BindingOperations]::GetBindingExpression($buttonSender, [System.Windows.Controls.Button]::IsEnabledProperty).UpdateSource()
+                
+                # Explicitly update the Copy and Browse buttons by finding them in the same row
+                $row = $buttonSender.DataContext
+                $copyButton = $stackPanel.Children | Where-Object { $_.Content -eq "Copy" -and $_.DataContext -eq $row }
+                $browseButton = $stackPanel.Children | Where-Object { $_.Content -eq "Browse" -and $_.DataContext -eq $row }
+                
+                if ($null -ne $copyButton) {
+                    $copyButton.IsEnabled = $false
+                }
+                
+                if ($null -ne $browseButton) {
+                    $browseButton.IsEnabled = $false
+                }
+            }
+            else {
+                $global:controls.LogOutput.AppendText("Failed to expire password. Please try again.`n")
+            }
+        }
+    })
+    $actionsFactory.AppendChild($expireButtonFactory)
+    
+    # Create the DataTemplate for the actions column
+    $actionsTemplate = New-Object System.Windows.DataTemplate
+    $actionsTemplate.VisualTree = $actionsFactory
+    $actionsColumn.CellTemplate = $actionsTemplate
+    
+    $gridView.Columns.Add($actionsColumn)
+    
+    # Set the GridView as the View for the ListView
+    $listView.View = $gridView
+    
+    # Add items to the ListView
+    foreach ($link in $script:PasswordLinks) {
+        [void]$listView.Items.Add($link)
+    }
+    
+    $grid.Children.Add($listView)
+    
+    # Add a close button
+    $closeButton = New-Object System.Windows.Controls.Button
+    $closeButton.Content = "Close"
+    $closeButton.Padding = New-Object System.Windows.Thickness(20, 5, 20, 5)
+    $closeButton.HorizontalAlignment = "Right"
+    $closeButton.Margin = New-Object System.Windows.Thickness(0, 10, 0, 0)
+    $closeButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 123, 255))
+    $closeButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))
+    $closeButton.Add_Click({ $linksWindow.Close() })
+    [System.Windows.Controls.Grid]::SetRow($closeButton, 2)
+    $grid.Children.Add($closeButton)
+    
+    # Set the content and show the window
+    $linksWindow.Content = $grid
+    $linksWindow.ShowDialog() | Out-Null
+}
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
 
@@ -45,10 +533,7 @@ $capitalO_umlaut = [char]0x00D6  # Ö
 # Helper function to calculate password entropy
 function Get-PasswordEntropy {
     param (
-        [System.Security.SecureString]$Password,
-        [bool]$HasUppercase,
-        [bool]$HasNumbers,
-        [bool]$HasSpecial
+        [System.Security.SecureString]$Password
     )
     
     # Convert SecureString to plain text for entropy calculation
@@ -56,10 +541,21 @@ function Get-PasswordEntropy {
     $PlainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
     [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
     
-    $poolSize = 26 # Lowercase letters
-    if ($HasUppercase) { $poolSize += 26 }
-    if ($HasNumbers) { $poolSize += 10 }
-    if ($HasSpecial) { $poolSize += 33 }
+    # Analyze the actual password content to determine which character sets are used
+    $hasLowercase = $PlainPassword -cmatch '[a-z]'
+    $hasUppercase = $PlainPassword -cmatch '[A-Z]'
+    $hasNumbers = $PlainPassword -cmatch '[0-9]'
+    $hasSpecial = $PlainPassword -match '[^a-zA-Z0-9]'
+    
+    # Calculate pool size based on character sets actually used
+    $poolSize = 0
+    if ($hasLowercase) { $poolSize += 26 } # Lowercase letters
+    if ($hasUppercase) { $poolSize += 26 } # Uppercase letters
+    if ($hasNumbers) { $poolSize += 10 }   # Numbers
+    if ($hasSpecial) { $poolSize += 6 }    # Special characters (matching C# version)
+    
+    # Default to lowercase if no character sets detected
+    if ($poolSize -eq 0) { $poolSize = 26 }
     
     $entropy = [Math]::Log($poolSize, 2) * $PlainPassword.Length
     return $entropy
@@ -138,7 +634,6 @@ $script:EnglishWords = @("time", "year", "people", "way", "day", "man", "thing",
                "start", "halt", "move", "stay", "come", "go", "arrive", "leave", "enter", "exit", "push", "pull", "carry", "drop", "catch", "throw", 
                "buy", "sell", "pay", "save", "spend", "find", "lose", "win", "fail", "try", "test", "pass", "stop", "continue", "begin", "finish", 
                "live", "die", "grow", "shrink", "rise", "fall", "increase", "decrease", "expand", "reduce")
-
 # Swedish words without å, ä, ö
 $script:SwedishWords = @("tid", "dag", "man", "barn", "liv", "hand", "del", "plats", "vecka", "grupp", 
                  "land", "problem", "fall", "system", "arbete", "morgon", "punkt", "hem", "vatten", "rum", 
@@ -218,6 +713,65 @@ function New-MemorablePassword {
     return $result
 }
 
+# Function to expire a password via Password Pusher API
+function Remove-Password {
+    param (
+        [string]$Token
+    )
+
+    $apiUrl = "https://pwpush.com/p/$Token.json"
+    $logOutput = "Attempting to expire password with token: $Token..."
+
+    # Check if the Password Pusher service is available
+    if (-not (Test-ServiceAvailability -ServiceUrl "https://pwpush.com")) {
+        return @{
+            Success = $false
+            Log = "Password Pusher API: Service unavailable"
+        }
+    }
+
+    try {
+        # Send DELETE request to expire the password
+        $headers = @{
+            "Accept" = "application/json"
+            "Content-Type" = "application/json"
+        }
+        
+        # Use Invoke-RestMethod without fallback to curl
+        Invoke-RestMethod -Uri $apiUrl -Method Delete -Headers $headers | Out-Null
+        $logOutput += "`nPassword successfully expired using Invoke-RestMethod."
+        
+        $logOutput += "`nPassword successfully expired."
+        $logOutput += "`nStatus: Expired"
+
+        return @{
+            Success = $true
+            Log = $logOutput
+        }
+    }
+    catch {
+        # Improved error handling
+        $errorMessage = $_.Exception.Message
+        $logOutput += "`nError: $errorMessage"
+        
+        # Check if it's a 404 Not Found error, which might mean the password is already expired
+        if ($errorMessage -like "*404*" -or $errorMessage -like "*Not Found*") {
+            $logOutput += "`nThe password may already be expired or not found."
+            # Return success anyway to update the UI
+            return @{
+                Success = $true
+                Log = $logOutput
+            }
+        }
+        
+        # For other errors, return failure
+        return @{
+            Success = $false
+            Log = $logOutput
+        }
+    }
+}
+
 # Function to check if a service is available
 function Test-ServiceAvailability {
     param (
@@ -231,6 +785,25 @@ function Test-ServiceAvailability {
 
         # Try to resolve the hostname and check connectivity
         $result = Test-Connection -ComputerName $hostname -Count 1 -Quiet
+        
+        # If Test-Connection succeeds, try a more direct HTTP check
+        if ($result) {
+            try {
+                # Try a HEAD request with a short timeout
+                $request = [System.Net.WebRequest]::Create($ServiceUrl)
+                $request.Method = "HEAD"
+                $request.Timeout = 5000 # 5 seconds timeout
+                $request.GetResponse().Close()
+                return $true
+            }
+            catch {
+                # Log the error but don't fail yet - the ping test passed
+                Write-Debug "HTTP check failed: $_"
+                # Still return true since the ping test passed
+                return $true
+            }
+        }
+        
         return $result
     }
     catch {
@@ -248,7 +821,7 @@ function Test-PwnedPassword {
     if (-not (Test-ServiceAvailability -ServiceUrl "https://api.pwnedpasswords.com")) {
         return @{
             Found = $false
-            Error = "Service unavailable: Have I Been Pwned API is not accessible. Please check your internet connection."
+            Error = "Have I Been Pwned API: Service unavailable"
         }
     }
 
@@ -258,14 +831,6 @@ function Test-PwnedPassword {
     [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
     
     try {
-    # Check if the HIBP service is available
-    if (-not (Test-ServiceAvailability -ServiceUrl "https://api.pwnedpasswords.com")) {
-        return @{
-            Found = $false
-            Error = "Service unavailable: Have I Been Pwned API is not accessible. Please check your internet connection."
-        }
-    }
-        
         # Convert the password to a SHA-1 hash
         $sha1 = New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
         $passwordBytes = [System.Text.Encoding]::UTF8.GetBytes($PlainPassword)
@@ -303,7 +868,6 @@ function Test-PwnedPassword {
         }
     }
 }
-
 # Function to get phonetic code for a character
 function Get-PhoneticCode {
     param (
@@ -335,7 +899,6 @@ function Get-PhoneticCode {
         '[' = 'Left Square Bracket'; ']' = 'Right Square Bracket';
         '{' = 'Left Curly Brace'; '}' = 'Right Curly Brace';
         '|' = 'Vertical Bar'; '<' = 'Less Than'; '>' = 'Greater Than'
-        # Note: Special characters like acute accent are handled in the Get-PhoneticCode function
     }
     
     # Define Swedish phonetic codes using the Unicode variables
@@ -369,10 +932,7 @@ function Get-PhoneticCode {
     # Get phonetic code
     $phonetic = $null
     
-    # Add Swedish special characters to the phonetic mapping
-    # We'll use a different approach to avoid adding keys multiple times
-    
-    # Special handling for Swedish characters using the Unicode variables
+    # Special handling for Swedish characters
     if ($PhoneticLanguage -eq "Swedish") {
         if ($lowerChar -eq $smallA_ring -or $lowerChar -eq $capitalA_ring) {
             $phonetic = $swedishA
@@ -828,7 +1388,7 @@ function Push-Password {
             Success = $false
             Url = ""
             IsQRCode = $false
-            Log = "Service unavailable: Password Pusher is not accessible. Please check your internet connection."
+            Log = "Password Pusher API: Service unavailable"
         }
     }
     
@@ -858,20 +1418,30 @@ function Push-Password {
                 $jsonResponse = $result.Substring($jsonStart, $jsonEnd - $jsonStart + 1)
                 $response = $jsonResponse | ConvertFrom-Json
                 
-                if ($response.url_token) {
-                    $url = "https://pwpush.com/p/" + $response.url_token
-                    $logOutput += "`nSuccess! Password pushed to: $url"
-                    
-                    if ($UseQRCode) {
-                        $logOutput += "`nThis URL contains a QR code that can be scanned to access the password."
-                    }
-                    
-                    return @{
-                        Success = $true
-                        Url = $url
-                        IsQRCode = $UseQRCode
-                        Log = $logOutput
-                    }
+            if ($response.url_token) {
+                $url = "https://pwpush.com/p/" + $response.url_token
+                $logOutput += "`nPassword successfully pushed using direct API method."
+                
+                if ($UseQRCode) {
+                    $logOutput += "`nThis URL contains a QR code that can be scanned to access the password."
+                }
+                
+                # Add the password link to the history collection
+                # Convert plain password to SecureString for the PasswordLinkModel
+                $securePasswordForHistory = New-Object System.Security.SecureString
+                foreach ($char in $PlainPassword.ToCharArray()) {
+                    $securePasswordForHistory.AppendChar($char)
+                }
+                $passwordLink = [PasswordLinkModel]::new($url, $securePasswordForHistory)
+                [void]$script:PasswordLinks.Add($passwordLink)
+                $logOutput += "`nAdded to password links history."
+                
+                return @{
+                    Success = $true
+                    Url = $url
+                    IsQRCode = $UseQRCode
+                    Log = $logOutput
+                }
                 }
                 else {
                     $logOutput += "`nError: Failed to extract URL token from response."
@@ -918,11 +1488,21 @@ function Push-Password {
             
             if ($response.url_token) {
                 $url = "https://pwpush.com/p/" + $response.url_token
-                $logOutput += "`nSuccess! Password pushed to: $url"
+                $logOutput += "`nPassword successfully pushed using curl method."
                 
                 if ($UseQRCode) {
                     $logOutput += "`nThis URL contains a QR code that can be scanned to access the password."
                 }
+                
+                # Add the password link to the history collection
+                # Convert plain password to SecureString for the PasswordLinkModel
+                $securePasswordForHistory = New-Object System.Security.SecureString
+                foreach ($char in $PlainPassword.ToCharArray()) {
+                    $securePasswordForHistory.AppendChar($char)
+                }
+                $passwordLink = [PasswordLinkModel]::new($url, $securePasswordForHistory)
+                [void]$script:PasswordLinks.Add($passwordLink)
+                $logOutput += "`nAdded to password links history."
                 
                 return @{
                     Success = $true
@@ -1014,7 +1594,7 @@ function Push-Password {
                         <ComboBoxItem Content="Swedish"/>
                     </ComboBox>
                     <TextBlock Grid.Column="5" Text="Presets:" VerticalAlignment="Center" Margin="10,0,10,0" Visibility="{Binding ElementName=RandomPasswordType, Path=IsChecked, Converter={StaticResource BooleanToVisibilityConverter}}"/>
-                    <ComboBox Grid.Column="6" x:Name="PasswordPresets" Width="150" HorizontalAlignment="Right" Visibility="{Binding ElementName=RandomPasswordType, Path=IsChecked, Converter={StaticResource BooleanToVisibilityConverter}}">
+                    <ComboBox Grid.Column="6" x:Name="PasswordPresets" Width="150" HorizontalAlignment="Right" SelectedIndex="1" Visibility="{Binding ElementName=RandomPasswordType, Path=IsChecked, Converter={StaticResource BooleanToVisibilityConverter}}">
                         <ComboBoxItem Content="Medium Password"/>
                         <ComboBoxItem Content="Strong Password"/>
                         <ComboBoxItem Content="Very Strong Password"/>
@@ -1184,10 +1764,12 @@ function Push-Password {
                         <ColumnDefinition Width="75*"/>
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <TextBox x:Name="ResultUrl" Grid.Column="0" Height="30" FontSize="14" IsReadOnly="True" VerticalContentAlignment="Center" Padding="5,0"/>
                     <Button x:Name="CopyUrlButton" Grid.Column="1" Content="Copy" Width="60" Height="30" Margin="10,0,0,0"/>
                     <Button x:Name="OpenInBrowserButton" Grid.Column="2" Content="Browse" Width="60" Height="30" Margin="10,0,0,0"/>
+                    <Button x:Name="HistoryButton" Grid.Column="3" Content="History" Width="60" Height="30" Margin="10,0,0,0"/>
                 </Grid>
             </Grid>
         </GroupBox>
@@ -1292,7 +1874,7 @@ function Push-Password {
                                 
                                 <StackPanel Orientation="Horizontal">
                                     <TextBlock Text="Version: " FontWeight="SemiBold"/>
-                                    <TextBlock x:Name="VersionText" Text="1.0"/>
+                                    <TextBlock x:Name="VersionText" Text="1.1"/>
                                 </StackPanel>
                             </StackPanel>
                             
@@ -1383,6 +1965,7 @@ function Set-LightTheme {
     $controls.CopyPasswordButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))
     
     $controls.CheckPwnedButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 123, 255))
+    # Explicitly set foreground to white for the Check button
     $controls.CheckPwnedButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))
     
     $controls.PushButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 123, 255))
@@ -1405,7 +1988,7 @@ function Update-PasswordStrength {
         [System.Security.SecureString]$Password
     )
     
-    $entropy = Get-PasswordEntropy -Password $Password -HasUppercase $controls.IncludeUppercase.IsChecked -HasNumbers $controls.IncludeNumbers.IsChecked -HasSpecial $controls.IncludeSpecial.IsChecked
+    $entropy = Get-PasswordEntropy -Password $Password
     
     # Set strength bar value (0-100)
     $strengthPercentage = [Math]::Min(100, ($entropy / 128) * 100)
@@ -1435,6 +2018,83 @@ function Update-PasswordStrength {
     
     # Also log to the log tab
     $controls.LogOutput.AppendText("Password entropy: $roundedEntropy bits`n")
+}
+
+# Function to measure a custom password's strength
+function Measure-CustomPassword {
+    param (
+        [System.Security.SecureString]$Password
+    )
+    
+    # Convert SecureString to plain text for evaluation
+    $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
+    $PlainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
+    [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
+    
+    # If password is empty, set zero entropy and disable buttons
+    if ([string]::IsNullOrWhiteSpace($PlainPassword)) {
+        $controls.StrengthBar.Value = 0
+        $controls.StrengthText.Text = "Weak"
+        $controls.StrengthBar.Foreground = "Red"
+        $controls.EntropyValue.Text = "0 bits"
+        
+        # Disable Copy and Phonetic buttons
+        $controls.CopyPasswordButton.IsEnabled = $false
+        $controls.PhoneticButton.IsEnabled = $false
+        $controls.PhoneticDropdownButton.IsEnabled = $false
+        
+        # Disable Check and Push buttons when password is empty
+        $controls.CheckPwnedButton.IsEnabled = $false
+        $controls.PushButton.IsEnabled = $false
+        
+        # Disable Copy and Browse buttons for password push result
+        $controls.CopyUrlButton.IsEnabled = $false
+        $controls.OpenInBrowserButton.IsEnabled = $false
+        
+        # Reset pwned status
+        $controls.PwnedStatus.Text = "Not checked"
+        $controls.PwnedStatus.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(128, 128, 128))
+        
+        # Log that password field is empty
+        $controls.LogOutput.AppendText("Password field is empty`n")
+        
+        return
+    }
+    
+    # Log that a custom password is being evaluated
+    $controls.LogOutput.AppendText("Evaluated custom password`n")
+    
+    # Enable buttons if password is not empty
+    $controls.CopyPasswordButton.IsEnabled = $true
+    $controls.PhoneticButton.IsEnabled = $true
+    $controls.PhoneticDropdownButton.IsEnabled = $true
+    
+    # Reset the password flags when the password is modified
+    $script:currentPasswordPushed = $false
+    $script:currentPasswordChecked = $false
+    
+    # Reset the Password Pusher result
+    $controls.ResultUrl.Text = ""
+    $controls.ResultUrl.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 0, 0))
+    
+    # Only enable the push button if the push timer is not running
+    if (-not $script:pushTimer.IsEnabled) {
+        $controls.PushButton.IsEnabled = $true
+        $controls.PushButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 123, 255))
+        $controls.PushButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))
+        $controls.PushButton.Content = "Push to Password Pusher"
+    }
+    
+    # Only enable the check button if the hibp timer is not running
+    if (-not $script:hibpTimer.IsEnabled) {
+        $controls.CheckPwnedButton.IsEnabled = $true
+        $controls.CheckPwnedButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 123, 255))
+        $controls.CheckPwnedButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))
+        $controls.CheckPwnedButton.Content = "Check"
+    }
+    
+    # Calculate entropy and update UI using the SecureString directly
+    Update-PasswordStrength -Password $Password
 }
 
 # Function to generate a password
@@ -1473,9 +2133,9 @@ function New-Password {
     $controls.ResultUrl.Text = ""
     $controls.ResultUrl.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 0, 0))
     
-    # Enable the copy and open buttons
-    $controls.CopyUrlButton.IsEnabled = $true
-    $controls.OpenInBrowserButton.IsEnabled = $true
+    # Keep the copy and open buttons disabled until a password is pushed
+    $controls.CopyUrlButton.IsEnabled = $false
+    $controls.OpenInBrowserButton.IsEnabled = $false
     
     # Reset the password flags
     $script:currentPasswordPushed = $false
@@ -1534,8 +2194,13 @@ $controls.GenerateButton.Add_Click({
 
 $controls.CopyPasswordButton.Add_Click({
     if ($controls.GeneratedPassword.Text) {
-        [System.Windows.Forms.Clipboard]::SetText($controls.GeneratedPassword.Text)
-        $controls.LogOutput.AppendText("Password copied to clipboard`n")
+        try {
+            [System.Windows.Forms.Clipboard]::SetText($controls.GeneratedPassword.Text)
+            $controls.LogOutput.AppendText("Password copied to clipboard`n")
+        }
+        catch {
+            $controls.LogOutput.AppendText("Error copying to clipboard: $($_.Exception.Message)`n")
+        }
     }
 })
 
@@ -1569,13 +2234,15 @@ $script:hibpTimer.Add_Tick({
             $controls.CheckPwnedButton.Content = "Already Checked"
         }
     } else {
-        # Update button text with current countdown
-        $controls.CheckPwnedButton.Content = "Wait ($script:hibpCountdown)s"
+        # Just display "Wait" without the countdown
+        $controls.CheckPwnedButton.Content = "Wait"
     }
 })
 
 $script:pushTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:pushTimer.Interval = [TimeSpan]::FromSeconds(1) # Update every second for countdown
+# Initialize the timer as stopped
+$script:pushTimer.IsEnabled = $false
 $script:pushTimer.Add_Tick({
     $script:pushCountdown--
     if ($script:pushCountdown -le 0) {
@@ -1598,8 +2265,8 @@ $script:pushTimer.Add_Tick({
             $controls.PushButton.Content = "Already Pushed"
         }
     } else {
-        # Update button text with current countdown
-        $controls.PushButton.Content = "Wait ($script:pushCountdown)s"
+        # Just display "Wait" without the countdown
+        $controls.PushButton.Content = "Wait"
     }
 })
 
@@ -1627,9 +2294,9 @@ $controls.CheckPwnedButton.Add_Click({
         
         # If the error contains "Service unavailable", display a more specific message
         if ($result.Error -like "*Service unavailable*") {
-            $controls.PwnedStatus.Text = "Have I Been Pwned service is not accessible"
-            $controls.PwnedStatus.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 165, 0))
-            $controls.LogOutput.AppendText("Have I Been Pwned service is not accessible. Please check your internet connection.`n")
+            $controls.PwnedStatus.Text = "Have I Been Pwned API: Service unavailable"
+            $controls.PwnedStatus.ClearValue([System.Windows.Controls.TextBlock]::ForegroundProperty)
+            $controls.LogOutput.AppendText("Have I Been Pwned API: Service unavailable`n")
         } else {
             $controls.PwnedStatus.Text = "Error checking"
             $controls.PwnedStatus.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 165, 0))
@@ -1639,7 +2306,12 @@ $controls.CheckPwnedButton.Add_Click({
         $controls.LogOutput.AppendText("Password found in $($result.Count) data breaches!`n")
         $controls.PwnedStatus.Text = "Found in $($result.Count) breaches!"
         $controls.PwnedStatus.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 0, 0))
+        
+        # Disable the push button and update its text to indicate the password is compromised
         $controls.PushButton.IsEnabled = $false
+        $controls.PushButton.Content = "Compromised Password - Not Secure to Share"
+        $controls.PushButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 0, 0)) # Red background
+        $controls.PushButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 0, 0)) # Black text for better visibility
     }
     else {
         $controls.LogOutput.AppendText("Password not found in any known data breaches.`n")
@@ -1654,8 +2326,8 @@ $controls.CheckPwnedButton.Add_Click({
     $controls.CheckPwnedButton.IsEnabled = $false
     $controls.CheckPwnedButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 165, 0)) # Orange
     $controls.CheckPwnedButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 0, 0)) # Black text for better visibility
-    $controls.CheckPwnedButton.FontWeight = "Bold" # Make text bold for better visibility
-    $controls.CheckPwnedButton.Content = "Wait (10)s"
+    $controls.CheckPwnedButton.FontWeight = "Normal"
+    $controls.CheckPwnedButton.Content = "Wait"
     $controls.LogOutput.AppendText("Rate limit applied: Check button disabled for 10 seconds`n")
     $script:hibpCountdown = 10
     $script:hibpTimer.Start()
@@ -1724,8 +2396,8 @@ $controls.PushButton.Add_Click({
             $controls.LogOutput.AppendText("Password Pusher service is not accessible. Please check your internet connection.`n")
             
             # Update the UI to show service unavailable status
-            $controls.ResultUrl.Text = "Password Pusher service is not accessible"
-            $controls.ResultUrl.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 165, 0)) # Orange warning color
+            $controls.ResultUrl.Text = "Password Pusher API: Service unavailable"
+            $controls.ResultUrl.ClearValue([System.Windows.Controls.TextBlock]::ForegroundProperty)
             
             # Disable the copy and open buttons since there's no valid URL
             $controls.CopyUrlButton.IsEnabled = $false
@@ -1740,8 +2412,8 @@ $controls.PushButton.Add_Click({
     $controls.PushButton.IsEnabled = $false
     $controls.PushButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 165, 0)) # Orange
     $controls.PushButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 0, 0)) # Black text for better visibility
-    $controls.PushButton.FontWeight = "Bold" # Make text bold for better visibility
-    $controls.PushButton.Content = "Wait (10)s"
+    $controls.PushButton.FontWeight = "Normal"
+    $controls.PushButton.Content = "Wait"
     $controls.LogOutput.AppendText("Rate limit applied: Push button disabled for 10 seconds`n")
     $script:pushCountdown = 10
     $script:pushTimer.Start()
@@ -1749,15 +2421,25 @@ $controls.PushButton.Add_Click({
 
 $controls.CopyUrlButton.Add_Click({
     if ($controls.ResultUrl.Text) {
-        [System.Windows.Forms.Clipboard]::SetText($controls.ResultUrl.Text)
-        $controls.LogOutput.AppendText("URL copied to clipboard`n")
+        try {
+            [System.Windows.Forms.Clipboard]::SetText($controls.ResultUrl.Text)
+            $controls.LogOutput.AppendText("URL copied to clipboard`n")
+        }
+        catch {
+            $controls.LogOutput.AppendText("Error copying to clipboard: $($_.Exception.Message)`n")
+        }
     }
 })
 
 $controls.OpenInBrowserButton.Add_Click({
     if ($controls.ResultUrl.Text) {
-        Start-Process $controls.ResultUrl.Text
-        $controls.LogOutput.AppendText("Opening URL in browser`n")
+        try {
+            Start-Process $controls.ResultUrl.Text
+            $controls.LogOutput.AppendText("Opening URL in browser`n")
+        }
+        catch {
+            $controls.LogOutput.AppendText("Error opening URL: $($_.Exception.Message)`n")
+        }
     }
 })
 
@@ -1811,8 +2493,22 @@ $hibpButton.Add_Click({
     $controls.LogOutput.AppendText("Opening Have I Been Pwned website in browser`n")
 })
 
+# Log application start - must be first log message
+$controls.LogOutput.AppendText("Application started`n")
+
 # Initialize the UI
 Set-LightTheme
+
+# Disable Copy and Browse buttons for Password Pusher at startup
+$controls.CopyUrlButton.IsEnabled = $false
+$controls.OpenInBrowserButton.IsEnabled = $false
+$controls.ResultUrl.Text = ""
+
+# Set History button color to match other buttons
+$historyButton = $window.FindName("HistoryButton")
+$historyButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 123, 255))
+$historyButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))
+
 New-Password
 
 # Add phonetic pronunciation button and dropdown
@@ -1823,6 +2519,8 @@ $controls.PhoneticButton.Add_Click({
         foreach ($char in $controls.GeneratedPassword.Text.ToCharArray()) {
             $securePassword.AppendChar($char)
         }
+        # Log showing phonetic codes with system name
+        $controls.LogOutput.AppendText("Showing Swedish phonetic codes`n")
         Show-PhoneticCodes -Password $securePassword -PhoneticLanguage "Swedish"
     }
 })
@@ -1840,6 +2538,8 @@ $natoMenuItem.Add_Click({
         foreach ($char in $controls.GeneratedPassword.Text.ToCharArray()) {
             $securePassword.AppendChar($char)
         }
+        # Log showing phonetic codes with system name
+        $controls.LogOutput.AppendText("Showing NATO phonetic codes`n")
         Show-PhoneticCodes -Password $securePassword -PhoneticLanguage "NATO"
     }
 }) | Out-Null
@@ -1855,6 +2555,8 @@ $swedishMenuItem.Add_Click({
         foreach ($char in $controls.GeneratedPassword.Text.ToCharArray()) {
             $securePassword.AppendChar($char)
         }
+        # Log showing phonetic codes with system name
+        $controls.LogOutput.AppendText("Showing Swedish phonetic codes`n")
         Show-PhoneticCodes -Password $securePassword -PhoneticLanguage "Swedish"
     }
 }) | Out-Null
@@ -1867,6 +2569,30 @@ $controls.PhoneticDropdownButton.Add_Click({
         $contextMenu.PlacementTarget = $controls.PhoneticDropdownButton
         $contextMenu.Placement = "Bottom"
     }
+})
+
+# Add History button handler
+$historyButton = $window.FindName("HistoryButton")
+$historyButton.Add_Click({
+    Show-PasswordLinksHistory
+    $controls.LogOutput.AppendText("Opened password links history window`n")
+})
+
+# Add TextChanged event handler to the password textbox for real-time entropy calculation
+$controls.GeneratedPassword.Add_TextChanged({
+    # Get the current text from the TextBox
+    $password = $controls.GeneratedPassword.Text
+    
+    # Create a SecureString from the plain text password
+    $securePassword = New-Object System.Security.SecureString
+    if (-not [string]::IsNullOrWhiteSpace($password)) {
+        foreach ($char in $password.ToCharArray()) {
+            $securePassword.AppendChar($char)
+        }
+    }
+    
+    # Measure the password strength and update UI
+    Measure-CustomPassword -Password $securePassword
 })
 
 # Add Loaded event handler to bring window to front

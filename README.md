@@ -36,11 +36,14 @@ SecurePassGenerator is a powerful tool designed to create, analyze, and securely
   - Password strength assessment with entropy calculation
   - Integration with Have I Been Pwned API for breach checking
   - Colored strength indicators
+  - Service availability detection and graceful handling
 
 - 🔄 **Secure Password Sharing**
   - Integration with [Password Pusher](https://pwpush.com) for secure sharing
   - Customizable expiration settings (time/views)
   - QR code generation for easy mobile access
+  - Password links history tracking
+  - Multiple API methods (Direct and Curl) for improved reliability
 
 ## Requirements
 
@@ -171,7 +174,13 @@ SecurePassGenerator provides two ways to generate passwords:
 
 ### Memorable Password Generation:
 
-![Memorable Password Generation](screenshots/main_memorable.png)
+#### English Words:
+
+![Memorable Password Generation - English](screenshots/main_memorable_eng.png)
+
+#### Swedish Words:
+
+![Memorable Password Generation - Swedish](screenshots/main_memorable_swe.png)
 
 ### Password Security
 
@@ -205,9 +214,13 @@ SecurePassGenerator provides two ways to generate passwords:
 
 - **Password Pusher Integration**: Securely share passwords with expiration settings
 
-  ### Password Pusher Integration:
+### Password Pusher Integration:
 
-  ![Password Pusher Integration](screenshots/main_pwpush.png)
+![Password Pusher Integration](screenshots/main_pwpush.png)
+
+### Password Successfully Pushed:
+
+![Password Successfully Pushed](screenshots/main_pwpush_pushed.png)
 
 - **Customization Options**:
   - Expire after X days
@@ -216,6 +229,7 @@ SecurePassGenerator provides two ways to generate passwords:
   - Add retrieval step
   - Generate QR code
   - Add passphrase protection
+  - Expire pushed password manually
 
 ## Application Structure
 
@@ -225,6 +239,8 @@ The application is divided into three tabs:
 
    - All password generation and sharing controls
    - Strength assessment and breach checking
+   - Password sharing with Password Pusher integration
+   - Password links history tracking and management
 
 2. **Log Tab**
 
@@ -265,6 +281,21 @@ SecurePassGenerator integrates with two external APIs:
 - Supports various expiration options
 - Multiple retrieval methods (including QR codes)
 - Includes cooldown periods between requests to prevent abuse
+- Dual API methods (Direct and Curl) for improved reliability
+- Service availability checking before API calls
+
+## Password Links History
+
+The application includes a comprehensive password links history feature:
+
+- **Track Shared Passwords**: Keep track of all passwords shared via Password Pusher
+- **Manage Links**: Copy, browse, or expire password links directly from the history window
+- **Status Monitoring**: See which links are active or expired
+- **Manual Expiration**: Ability to manually expire a password link before its scheduled expiration
+
+### Password Links History Window:
+
+![Password Links History](screenshots/main_pwpush_history.png)
 
 ## Security Considerations
 
@@ -274,6 +305,13 @@ SecurePassGenerator integrates with two external APIs:
 - **Local Processing**: Password entropy calculation is performed locally
 - **Privacy Protection**: Have I Been Pwned API checks use the k-anonymity model
 - **API Protection**: Rate limiting is implemented to prevent API abuse
+- **Service Unavailability Handling**: Graceful handling when external services are unavailable
+
+  ### Service Unavailability Detection:
+
+  ![Service Unavailability](screenshots/service_unavailable.png)
+
+- **Cooldown Timers**: 10-second cooldowns implemented for both HIBP and Password Pusher to prevent excessive API calls
 
 ## Reporting Issues
 

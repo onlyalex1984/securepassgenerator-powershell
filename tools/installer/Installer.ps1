@@ -85,7 +85,7 @@ param (
 
 # Application configuration
 # Using ShortcutName for both the shortcut and app name for consistency
-$ExeName = "SecurePassGenerator.ps1"
+$ScriptName = "SecurePassGenerator.ps1"
 $ShortcutName = "SecurePassGenerator"
 $ShortcutDescription = "Generate secure passwords with a modern GUI"
 $IconName = "securepassgenerator.ico"  # Icon filename to use for the shortcut
@@ -319,17 +319,12 @@ function Install-OfflineApp {
     Write-Log "Starting offline installation" -Level "INFO"
     
     try {
-        # First, prioritize finding the script file directly
+        # Look for the script file directly
         Write-Log "Looking for script file in the current directory..." -Level "INFO"
-        $SourceScript = Join-Path -Path $PSScriptRoot -ChildPath $ExeName
+        $SourceScript = Join-Path -Path $PSScriptRoot -ChildPath $ScriptName
         
-        # Also look for any PowerShell script in the current directory
         if (-not (Test-Path -Path $SourceScript)) {
-            $ScriptFiles = Get-ChildItem -Path $PSScriptRoot -Filter "*.ps1"
-            if ($ScriptFiles.Count -gt 0) {
-                $SourceScript = $ScriptFiles[0].FullName
-                Write-Log "Found script: $($ScriptFiles[0].Name)" -Level "INFO"
-            }
+            Write-Log "Script file $ScriptName not found in the current directory" -Level "WARNING"
         }
         
         # If script found, use it directly (no hash verification needed)
@@ -367,7 +362,7 @@ function Install-OfflineApp {
         # Process based on source type
         if ($SourceType -eq "ps1") {
             # Copy script and any supporting files to destination
-            Write-Log "Copying $ExeName to $InstallDir" -Level "INFO"
+            Write-Log "Copying $ScriptName to $InstallDir" -Level "INFO"
             Copy-Item -Path $SourcePath -Destination $InstallDir -Force
             
             # Copy any supporting module files if they exist
@@ -396,7 +391,7 @@ function Install-OfflineApp {
             $IconPath = Copy-IconFile -SourceDir $PSScriptRoot -DestinationDir $InstallDir
             
             # Create shortcut
-            $ScriptPath = Join-Path -Path $InstallDir -ChildPath $ExeName
+            $ScriptPath = Join-Path -Path $InstallDir -ChildPath $ScriptName
             $ShortcutPath = Join-Path -Path $DesktopPath -ChildPath "$ShortcutName.lnk"
             
             # Create PowerShell shortcut to execute the script
@@ -528,7 +523,19 @@ function Install-OfflineApp {
                 Write-Log "Found extracted subdirectory: $ExtractedDir" -Level "INFO"
                 
                 # Find the script and LICENSE files
-                $ScriptFile = Get-ChildItem -Path $ExtractedDir -Filter "*.ps1" | Select-Object -First 1
+                # Look for the script file by name
+                $ScriptFile = Get-ChildItem -Path $ExtractedDir -Filter $ScriptName | Select-Object -First 1
+                
+                # If not found, log a warning
+                if ($null -eq $ScriptFile) {
+                    Write-Log "WARNING: Could not find $ScriptName in the extracted directory" -Level "WARNING"
+                    
+                    # As a fallback, look for any .ps1 file
+                    $ScriptFile = Get-ChildItem -Path $ExtractedDir -Filter "*.ps1" | Select-Object -First 1
+                    if ($ScriptFile) {
+                        Write-Log "Using alternative script file: $($ScriptFile.Name)" -Level "WARNING"
+                    }
+                }
                 $LicenseFile = Get-ChildItem -Path $ExtractedDir -Filter "LICENSE*" | Select-Object -First 1
                 
                 if ($ScriptFile) {
@@ -572,11 +579,15 @@ function Install-OfflineApp {
                 return $false
             }
             
-            $MainScript = $ScriptFiles | Where-Object { $_.Name -like "SecurePassGenerator*.ps1" } | Select-Object -First 1
-            if ($null -eq $MainScript) {
-                $MainScript = $ScriptFiles | Select-Object -First 1
-                Write-Log "Using first found script: $($MainScript.FullName)" -Level "WARNING"
-            }
+        # Look for the script file by name
+        $MainScript = $ScriptFiles | Where-Object { $_.Name -eq $ScriptName } | Select-Object -First 1
+        
+        # If not found, log an error
+        if ($null -eq $MainScript) {
+            Write-Log "ERROR: Could not find $ScriptName in the installation directory" -Level "ERROR"
+            Write-Log "Available scripts: $($ScriptFiles.Name -join ', ')" -Level "INFO"
+            return $false
+        }
             else {
                 Write-Log "Found main script: $($MainScript.FullName)" -Level "INFO"
             }
@@ -943,7 +954,19 @@ function Install-OnlineApp {
                 Write-Log "Found extracted subdirectory: $ExtractedDir" -Level "INFO"
                 
                 # Find the script and LICENSE files
-                $ScriptFile = Get-ChildItem -Path $ExtractedDir -Filter "*.ps1" | Select-Object -First 1
+                # Look for the script file by name
+                $ScriptFile = Get-ChildItem -Path $ExtractedDir -Filter $ScriptName | Select-Object -First 1
+                
+                # If not found, log a warning
+                if ($null -eq $ScriptFile) {
+                    Write-Log "WARNING: Could not find $ScriptName in the extracted directory" -Level "WARNING"
+                    
+                    # As a fallback, look for any .ps1 file except Installer.ps1
+                    $ScriptFile = Get-ChildItem -Path $ExtractedDir -Filter "*.ps1" | Where-Object { $_.Name -ne "Installer.ps1" } | Select-Object -First 1
+                    if ($ScriptFile) {
+                        Write-Log "Using alternative script file: $($ScriptFile.Name)" -Level "WARNING"
+                    }
+                }
                 $LicenseFile = Get-ChildItem -Path $ExtractedDir -Filter "LICENSE*" | Select-Object -First 1
                 
                 if ($ScriptFile) {
@@ -991,10 +1014,14 @@ function Install-OnlineApp {
             return $false
         }
         
-        $MainScript = $ScriptFiles | Where-Object { $_.Name -like "SecurePassGenerator*.ps1" } | Select-Object -First 1
+        # Look for the script file by name
+        $MainScript = $ScriptFiles | Where-Object { $_.Name -eq $ScriptName } | Select-Object -First 1
+        
+        # If not found, log an error
         if ($null -eq $MainScript) {
-            $MainScript = $ScriptFiles | Select-Object -First 1
-            Write-Log "Using first found script: $($MainScript.FullName)" -Level "WARNING"
+            Write-Log "ERROR: Could not find $ScriptName in the installation directory" -Level "ERROR"
+            Write-Log "Available scripts: $($ScriptFiles.Name -join ', ')" -Level "INFO"
+            return $false
         }
         else {
             Write-Log "Found main script: $($MainScript.FullName)" -Level "INFO"

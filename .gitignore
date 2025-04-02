@@ -1,0 +1,98 @@
+### Operating System Files ###
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+### Editor and IDE Files ###
+# VS Code
+.vscode/
+*.code-workspace
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+
+# JetBrains IDEs
+.idea/
+*.iml
+*.iws
+
+# Vim
+*~
+.*.sw[a-p]
+.vim
+
+# Sublime Text
+*.sublime-workspace
+*.sublime-project
+
+### Temporary Files ###
+# General
+*.tmp
+*.temp
+.cache/
+*.bak
+
+# Log files
+logs/
+log/
+*.log
+
+# Documentation folder
+.docs/
+
+### Security and Secrets ###
+# Environment variables
+.env
+.env.*
+*.env
+
+# Keys and credentials
+*.key
+*.pem
+*.crt
+*.cer
+*.p12
+*.pfx
+*.pw
+*.enc
+*.cred
+*.creds
+*.credentials
+*.secret
+*.secrets
+
+### Project Specific ###
+# Output directories
+output/
+
+# Import directories
+import/
+
+# Test directories
+test/
+tests/
+
+# Documentation build
+docs/_build/
+_site/
+
+### Data Files ###
+*.txt
+*.xlsx
+
+### Runtime Data ###
+pids
+*.pid
+*.seed
+*.pid.lock

@@ -5,7 +5,7 @@ All notable changes to the SecurePassGenerator will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.1.0-pre.2] - April 2025
+## [1.1.0] - April 2025
 
 ### Added
 
@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Smart installer location detection with fallback options
   - Seamless update process with minimal user interaction
   - Preservation of custom presets during updates
+- Password Preset Management:
+  - Save and load custom password presets
+  - Create, edit, and delete user-defined presets
+  - Enable/disable presets to customize dropdown options
+  - Set default preset for application startup
+  - Automatic backup of presets file when saving changes
+  - Additional built-in presets (NIST Compliant, SOC 2 Compliant, Financial Compliant)
 
 ### Improved
 
@@ -28,18 +35,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Enhanced internet connectivity detection for corporate environments
   - Added detailed logging for troubleshooting
   - Multiple download methods with automatic fallback for improved reliability
-
-## [1.1.0-pre.1] - April 2025
-
-### Added
-
-- Password Preset Management:
-  - Save and load custom password presets
-  - Create, edit, and delete user-defined presets
-  - Enable/disable presets to customize dropdown options
-  - Set default preset for application startup
-  - Automatic backup of presets file when saving changes
-  - Additional built-in presets (NIST Compliant, SOC 2 Compliant, Financial Compliant)
 
 ## [1.0.0] - April 2025
 

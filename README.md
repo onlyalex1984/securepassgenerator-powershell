@@ -2,7 +2,7 @@
 
 A comprehensive PowerShell password generation and secure sharing tool with modern WPF GUI.
 
-![Version](https://img.shields.io/badge/version-1.0-blue.svg)
+![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1+-blue.svg)
 ![License](https://img.shields.io/badge/License-GPLv3-green.svg)
@@ -24,6 +24,12 @@ SecurePassGenerator is a powerful tool designed to create, analyze, and securely
   - Customizable length, complexity, and character sets
   - Multiple language support for memorable passwords (English/Swedish)
   - Predefined password presets for different security levels
+  - Custom password preset management:
+    - Save and load custom password presets
+    - Create, edit, and delete user-defined presets
+    - Enable/disable presets to customize dropdown options
+    - Set default preset for application startup
+    - Automatic backup of presets file when saving changes
 
 - 🔤 **Phonetic Pronunciation**
 
@@ -49,6 +55,35 @@ SecurePassGenerator is a powerful tool designed to create, analyze, and securely
 
 - PowerShell 5.1 or higher
 - Windows with .NET Framework (included with Windows)
+
+## Password Presets
+
+SecurePassGenerator includes a comprehensive preset management system that allows you to:
+
+- Create custom presets with your preferred password settings
+- Edit existing presets to adjust their parameters
+- Enable or disable presets to customize the dropdown options
+- Set a default preset that will be automatically selected at startup
+- Automatic backup of your presets file when making changes
+
+The application comes with several built-in presets:
+
+- Medium Password (10 characters)
+- Strong Password (15 characters)
+- Very Strong Password (20 characters)
+- NIST Compliant (12 characters)
+- SOC 2 Compliant (14 characters)
+- Financial Compliant (16 characters)
+
+## Updates and Maintenance
+
+SecurePassGenerator includes an integrated update system that provides:
+
+- Check for updates directly from within the application
+- Support for both stable and pre-release versions
+- Smart installer location detection with fallback options
+- Seamless update process with minimal user interaction
+- Preservation of custom presets during updates
 
 ## Installation
 
@@ -164,7 +199,12 @@ SecurePassGenerator provides two ways to generate passwords:
 
 - Choose length (8-32 characters)
 - Select character types (uppercase, lowercase, numbers, special characters)
-- Apply presets (Medium, Strong, Very Strong)
+- Apply presets (Medium, Strong, Very Strong, NIST Compliant, SOC 2 Compliant, Financial Compliant)
+- Create and manage custom presets:
+  - Save current settings as a new preset
+  - Edit existing custom presets
+  - Enable/disable presets to customize dropdown options
+  - Set a default preset for application startup
 
 #### Memorable Passwords
 

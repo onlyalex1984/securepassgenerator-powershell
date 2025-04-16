@@ -9,10 +9,12 @@
 
     Key Features:
     - Multiple password generation methods (random or memorable)
+    - Built-in and custom password presets with management capabilities
     - Real-time password strength assessment with entropy calculation
     - Integration with Have I Been Pwned to check for compromised passwords
     - Secure password sharing via Password Pusher with configurable settings
     - QR code generation for mobile access
+    - Integrated update system with support for stable and pre-release versions
     - Rate-limited API interactions to respect service limitations
     
     Note: This script implements cooldown timers between API requests to respect
@@ -20,7 +22,7 @@
 
 .NOTES
     File Name      : SecurePassGenerator.ps1
-    Version        : 1.0
+    Version        : 1.1.0
     Author         : onlyalex1984
     Copyright      : (C) 2025 onlyalex1984
     License        : GPL v3 - Full license text available in the project root directory
@@ -31,11 +33,450 @@
 #>
 
 # Script configuration
-$script:Version = "1.0"
+$script:Version = "1.1.0"
 $script:ScriptDisplayName = "SecurePassGenerator"
+
+# Application paths
+$script:AppDataPath = [System.Environment]::GetFolderPath('ApplicationData')
+$script:InstallDir = Join-Path -Path $script:AppDataPath -ChildPath "securepassgenerator-ps"
+$script:InstallerPath = Join-Path -Path $script:InstallDir -ChildPath "Installer.ps1"
 
 # Password links history collection
 $script:PasswordLinks = New-Object System.Collections.ArrayList
+
+# Password presets collection and file path
+$script:PasswordPresets = New-Object System.Collections.ArrayList
+# Get the directory where the script is located
+$script:ScriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+# Store presets in the InstallDir for consistency across different execution locations
+$script:PresetsFilePath = Join-Path -Path $script:InstallDir -ChildPath "presets.json"
+
+# Password preset model class
+class PasswordPresetModel {
+    [string]$Name
+    [int]$Length
+    [bool]$IncludeUppercase
+    [bool]$IncludeLowercase = $true  # Always true as lowercase is always included
+    [bool]$IncludeNumbers
+    [bool]$IncludeSpecial
+    [bool]$IsDefault = $false  # Indicates if this is a built-in preset
+    [bool]$Enabled = $true     # Indicates if this preset is enabled
+    [bool]$IsSelectedByDefault = $false  # Indicates if this preset should be selected by default on startup
+
+    PasswordPresetModel([string]$name, [int]$length, [bool]$includeUppercase, [bool]$includeNumbers, [bool]$includeSpecial) {
+        $this.Name = $name
+        $this.Length = $length
+        $this.IncludeUppercase = $includeUppercase
+        $this.IncludeNumbers = $includeNumbers
+        $this.IncludeSpecial = $includeSpecial
+    }
+    
+    # Clone method to create a copy of the preset
+    [PasswordPresetModel] Clone() {
+        $clone = [PasswordPresetModel]::new($this.Name, $this.Length, $this.IncludeUppercase, $this.IncludeNumbers, $this.IncludeSpecial)
+        $clone.IsDefault = $this.IsDefault
+        $clone.Enabled = $this.Enabled
+        $clone.IsSelectedByDefault = $this.IsSelectedByDefault
+        return $clone
+    }
+    
+    # Convert to JSON-friendly hashtable
+    [hashtable] ToHashtable() {
+        return @{
+            Name = $this.Name
+            Length = $this.Length
+            IncludeUppercase = $this.IncludeUppercase
+            IncludeLowercase = $this.IncludeLowercase
+            IncludeNumbers = $this.IncludeNumbers
+            IncludeSpecial = $this.IncludeSpecial
+            IsDefault = $this.IsDefault
+            Enabled = $this.Enabled
+            IsSelectedByDefault = $this.IsSelectedByDefault
+        }
+    }
+}
+
+# Loads password presets from JSON file or creates default presets if file doesn't exist
+function Import-PasswordPresets {
+    # Create directory if it doesn't exist
+    $presetsDir = Split-Path -Path $script:PresetsFilePath -Parent
+    if (-not (Test-Path -Path $presetsDir)) {
+        try {
+            New-Item -Path $presetsDir -ItemType Directory -Force | Out-Null
+            $global:controls.LogOutput.AppendText("Created presets directory: $presetsDir`n")
+        }
+        catch {
+            $global:controls.LogOutput.AppendText("Error creating presets directory: $($_.Exception.Message)`n")
+        }
+    }
+    
+    # Clear existing presets
+    $script:PasswordPresets.Clear()
+    
+    # Check if presets file exists
+    if (Test-Path -Path $script:PresetsFilePath) {
+        try {
+            # Read and parse JSON file
+            $presetsJson = Get-Content -Path $script:PresetsFilePath -Raw
+            $presetsData = $presetsJson | ConvertFrom-Json
+            
+            # Add each preset to the collection
+            foreach ($presetData in $presetsData) {
+                $preset = [PasswordPresetModel]::new(
+                    $presetData.Name,
+                    $presetData.Length,
+                    $presetData.IncludeUppercase,
+                    $presetData.IncludeNumbers,
+                    $presetData.IncludeSpecial
+                )
+                
+                # Set IsDefault property if it exists in the JSON
+                if (Get-Member -InputObject $presetData -Name "IsDefault" -MemberType Properties) {
+                    $preset.IsDefault = $presetData.IsDefault
+                }
+                
+                # Set Enabled property if it exists in the JSON
+                if (Get-Member -InputObject $presetData -Name "Enabled" -MemberType Properties) {
+                    $preset.Enabled = $presetData.Enabled
+                }
+                
+                # Set IsSelectedByDefault property if it exists in the JSON
+                if (Get-Member -InputObject $presetData -Name "IsSelectedByDefault" -MemberType Properties) {
+                    $preset.IsSelectedByDefault = $presetData.IsSelectedByDefault
+                }
+                
+                [void]$script:PasswordPresets.Add($preset)
+            }
+            
+            $global:controls.LogOutput.AppendText("Loaded $($script:PasswordPresets.Count) presets from $script:PresetsFilePath`n")
+        }
+        catch {
+            $global:controls.LogOutput.AppendText("Error loading presets: $($_.Exception.Message)`n")
+            $global:controls.LogOutput.AppendText("Loading default presets instead`n")
+            Add-DefaultPresets
+        }
+    }
+    else {
+        # File doesn't exist, create default presets
+        $global:controls.LogOutput.AppendText("Presets file not found. Creating default presets`n")
+        Add-DefaultPresets
+        
+        # Don't save the default presets to file until changes are made
+        # This prevents creating the file unnecessarily on startup
+    }
+    
+    # Update the UI with the loaded presets
+    Update-PresetsDropdown
+}
+
+# Adds default presets to the collection
+function Add-DefaultPresets {
+    # Clear existing presets
+    $script:PasswordPresets.Clear()
+    
+    # Medium Password (10 chars)
+    $mediumPreset = [PasswordPresetModel]::new("Medium Password", 10, $true, $true, $true)
+    $mediumPreset.IsDefault = $true
+    [void]$script:PasswordPresets.Add($mediumPreset)
+    
+    # Strong Password (15 chars)
+    $strongPreset = [PasswordPresetModel]::new("Strong Password", 15, $true, $true, $true)
+    $strongPreset.IsDefault = $true
+    $strongPreset.IsSelectedByDefault = $true
+    [void]$script:PasswordPresets.Add($strongPreset)
+    
+    # Very Strong Password (20 chars)
+    $veryStrongPreset = [PasswordPresetModel]::new("Very Strong Password", 20, $true, $true, $true)
+    $veryStrongPreset.IsDefault = $true
+    [void]$script:PasswordPresets.Add($veryStrongPreset)
+    
+    # NIST Compliant (12 chars)
+    $nistPreset = [PasswordPresetModel]::new("NIST Compliant", 12, $true, $true, $true)
+    $nistPreset.IsDefault = $true
+    [void]$script:PasswordPresets.Add($nistPreset)
+    
+    # SOC 2 Compliant (14 chars)
+    $soc2Preset = [PasswordPresetModel]::new("SOC 2 Compliant", 14, $true, $true, $true)
+    $soc2Preset.IsDefault = $true
+    [void]$script:PasswordPresets.Add($soc2Preset)
+    
+    # Financial Compliant (16 chars)
+    $financialPreset = [PasswordPresetModel]::new("Financial Compliant", 16, $true, $true, $true)
+    $financialPreset.IsDefault = $true
+    [void]$script:PasswordPresets.Add($financialPreset)
+    
+    $global:controls.LogOutput.AppendText("Added default presets`n")
+}
+
+# Saves password presets to JSON file
+function Save-PasswordPresets {
+    try {
+        # Create directory if it doesn't exist
+        $presetsDir = Split-Path -Path $script:PresetsFilePath -Parent
+        if (-not (Test-Path -Path $presetsDir)) {
+            New-Item -Path $presetsDir -ItemType Directory -Force | Out-Null
+        }
+        
+        # Create backup of existing file if it exists
+        if (Test-Path -Path $script:PresetsFilePath) {
+            $backupPath = "$script:PresetsFilePath.bak"
+            Copy-Item -Path $script:PresetsFilePath -Destination $backupPath -Force
+            $global:controls.LogOutput.AppendText("Created backup of presets file: $backupPath`n")
+        }
+        
+        # Convert presets to array of hashtables for JSON serialization
+        $presetsData = @()
+        foreach ($preset in $script:PasswordPresets) {
+            $presetsData += $preset.ToHashtable()
+        }
+        
+        # Convert to JSON and save to file
+        $presetsJson = $presetsData | ConvertTo-Json -Depth 5
+        Set-Content -Path $script:PresetsFilePath -Value $presetsJson -Force
+        
+        $global:controls.LogOutput.AppendText("Saved $($script:PasswordPresets.Count) presets to $script:PresetsFilePath`n")
+        return $true
+    }
+    catch {
+        $global:controls.LogOutput.AppendText("Error saving presets: $($_.Exception.Message)`n")
+        return $false
+    }
+}
+
+# Updates the presets dropdown with current presets
+function Update-PresetsDropdown {
+    if (-not $global:controls -or -not $global:controls.PasswordPresets) {
+        return
+    }
+    
+    # Clear existing items
+    $global:controls.PasswordPresets.Items.Clear()
+    
+    # Maximum length for preset names in dropdown
+    $maxDisplayLength = 32
+    
+    # Add only enabled presets to the dropdown
+    $enabledPresets = $script:PasswordPresets | Where-Object { $_.Enabled }
+    $defaultPresetIndex = -1
+    $currentIndex = 0
+    
+    foreach ($preset in $enabledPresets) {
+        $item = New-Object System.Windows.Controls.ComboBoxItem
+        
+        # Truncate long preset names
+        if ($preset.Name.Length -gt $maxDisplayLength) {
+            $displayName = $preset.Name.Substring(0, $maxDisplayLength) + "..."
+        } else {
+            $displayName = $preset.Name
+        }
+        
+        $item.Content = $displayName
+        $item.Tag = $preset
+        $item.ToolTip = $preset.Name  # Show full name in tooltip
+        [void]$global:controls.PasswordPresets.Items.Add($item)
+        
+        # Check if this is the default preset to select
+        if ($preset.IsSelectedByDefault) {
+            $defaultPresetIndex = $currentIndex
+        }
+        
+        $currentIndex++
+    }
+    
+    # Select the default preset if one is marked, otherwise select the first item
+    if ($global:controls.PasswordPresets.Items.Count -gt 0) {
+        if ($defaultPresetIndex -ge 0) {
+            $global:controls.PasswordPresets.SelectedIndex = $defaultPresetIndex
+            $global:controls.LogOutput.AppendText("Selected default preset: $($enabledPresets[$defaultPresetIndex].Name)`n")
+        } else {
+            $global:controls.PasswordPresets.SelectedIndex = 0
+        }
+    } else {
+        # If no enabled presets, enable the first preset to ensure at least one is always enabled
+        if ($script:PasswordPresets.Count -gt 0) {
+            $script:PasswordPresets[0].Enabled = $true
+            # Recursively call this function to update the dropdown with the newly enabled preset
+            Update-PresetsDropdown
+        }
+    }
+}
+
+# Adds a new preset to the collection
+function Add-PasswordPreset {
+    param (
+        [string]$Name,
+        [int]$Length,
+        [bool]$IncludeUppercase,
+        [bool]$IncludeNumbers,
+        [bool]$IncludeSpecial,
+        [bool]$IsSelectedByDefault = $false
+    )
+    
+    # Check if a preset with this name already exists
+    $existingPreset = $script:PasswordPresets | Where-Object { $_.Name -eq $Name }
+    if ($existingPreset) {
+        $global:controls.LogOutput.AppendText("A preset with the name '$Name' already exists`n")
+        return $false
+    }
+    
+    # Create and add the new preset
+    $preset = [PasswordPresetModel]::new($Name, $Length, $IncludeUppercase, $IncludeNumbers, $IncludeSpecial)
+    $preset.IsSelectedByDefault = $IsSelectedByDefault
+    
+    # If this preset is being set as default, unset any other presets
+    if ($preset.IsSelectedByDefault) {
+        foreach ($otherPreset in $script:PasswordPresets) {
+            $otherPreset.IsSelectedByDefault = $false
+        }
+    }
+    
+    [void]$script:PasswordPresets.Add($preset)
+    
+    # Save presets to file
+    $result = Save-PasswordPresets
+    
+    # Update the UI
+    if ($result) {
+        Update-PresetsDropdown
+        $global:controls.LogOutput.AppendText("Added new preset: $Name`n")
+    }
+    
+    return $result
+}
+
+# Removes a preset from the collection
+function Remove-PasswordPreset {
+    param (
+        [string]$Name
+    )
+    
+    # Find the preset to remove
+    $presetToRemove = $script:PasswordPresets | Where-Object { $_.Name -eq $Name }
+    if (-not $presetToRemove) {
+        $global:controls.LogOutput.AppendText("Preset '$Name' not found`n")
+        return $false
+    }
+    
+    # Check if it's a default preset
+    if ($presetToRemove.IsDefault) {
+        $global:controls.LogOutput.AppendText("Cannot remove default preset: $Name`n")
+        return $false
+    }
+    
+    # Check if the preset being removed was selected by default
+    $wasSelectedByDefault = $presetToRemove.IsSelectedByDefault
+    
+    # Remove the preset
+    [void]$script:PasswordPresets.Remove($presetToRemove)
+    
+    # If the removed preset was selected by default, set the Strong Password preset as default
+    if ($wasSelectedByDefault) {
+        $strongPreset = $script:PasswordPresets | Where-Object { $_.Name -eq "Strong Password" }
+        if ($strongPreset) {
+            $strongPreset.IsSelectedByDefault = $true
+            $global:controls.LogOutput.AppendText("Fallback to Strong Password as default`n")
+        }
+    }
+    
+    # Save presets to file
+    $result = Save-PasswordPresets
+    
+    # Update the UI
+    if ($result) {
+        Update-PresetsDropdown
+        $global:controls.LogOutput.AppendText("Removed preset: $Name`n")
+    }
+    
+    return $result
+}
+
+# Edits an existing preset
+function Edit-PasswordPreset {
+    param (
+        [string]$OriginalName,
+        [string]$NewName,
+        [int]$Length,
+        [bool]$IncludeUppercase,
+        [bool]$IncludeNumbers,
+        [bool]$IncludeSpecial,
+        [bool]$IsSelectedByDefault
+    )
+    
+    # Find the preset to edit
+    $presetToEdit = $script:PasswordPresets | Where-Object { $_.Name -eq $OriginalName }
+    if (-not $presetToEdit) {
+        $global:controls.LogOutput.AppendText("Preset '$OriginalName' not found`n")
+        return $false
+    }
+    
+    # Check if it's a default preset and name is being changed
+    if ($presetToEdit.IsDefault -and $OriginalName -ne $NewName) {
+        $global:controls.LogOutput.AppendText("Cannot rename default preset: $OriginalName`n")
+        return $false
+    }
+    
+    # Check if new name conflicts with existing preset
+    if ($OriginalName -ne $NewName) {
+        $existingPreset = $script:PasswordPresets | Where-Object { $_.Name -eq $NewName }
+        if ($existingPreset) {
+            $global:controls.LogOutput.AppendText("A preset with the name '$NewName' already exists`n")
+            return $false
+        }
+    }
+    
+    # Update the preset properties
+    $presetToEdit.Name = $NewName
+    $presetToEdit.Length = $Length
+    $presetToEdit.IncludeUppercase = $IncludeUppercase
+    $presetToEdit.IncludeNumbers = $IncludeNumbers
+    $presetToEdit.IncludeSpecial = $IncludeSpecial
+    $presetToEdit.IsSelectedByDefault = $IsSelectedByDefault
+    
+    # If this preset is being set as default, unset any other presets
+    if ($presetToEdit.IsSelectedByDefault) {
+        foreach ($otherPreset in $script:PasswordPresets) {
+            if ($otherPreset -ne $presetToEdit) {
+                $otherPreset.IsSelectedByDefault = $false
+            }
+        }
+    }
+    
+    # Save presets to file
+    $result = Save-PasswordPresets
+    
+    # Update the UI
+    if ($result) {
+        Update-PresetsDropdown
+        $global:controls.LogOutput.AppendText("Updated preset: $OriginalName -> $NewName`n")
+    }
+    
+    return $result
+}
+
+# Gets current UI settings as a preset model
+function Get-CurrentSettings {
+    $name = "Custom Preset"
+    $length = 12
+    $includeUppercase = $true
+    $includeNumbers = $true
+    $includeSpecial = $true
+    
+    if ($global:controls) {
+        if ($global:controls.RandomPasswordType.IsChecked) {
+            $length = [int]$global:controls.PasswordLength.Value
+        }
+        else {
+            # For memorable passwords, use a default length
+            $length = 12
+        }
+        
+        $includeUppercase = $global:controls.IncludeUppercase.IsChecked
+        $includeNumbers = $global:controls.IncludeNumbers.IsChecked
+        $includeSpecial = $global:controls.IncludeSpecial.IsChecked
+    }
+    
+    return [PasswordPresetModel]::new($name, $length, $includeUppercase, $includeNumbers, $includeSpecial)
+}
 
 # Password link model class
 class PasswordLinkModel {
@@ -64,6 +505,1316 @@ class PasswordLinkModel {
             $global:controls.LogOutput.AppendText("Failed to extract token from URL: $($this.Url)`n")
         }
         return ""
+    }
+}
+
+# Displays password preset management window
+function Show-PasswordPresets {
+    # Create a new window for the password presets
+    $presetsWindow = New-Object System.Windows.Window
+    $presetsWindow.Title = "Password Presets"
+    $presetsWindow.Width = 580
+    $presetsWindow.Height = 400
+    $presetsWindow.WindowStartupLocation = "CenterScreen"
+    $presetsWindow.ResizeMode = "CanResize"
+    $presetsWindow.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(245, 245, 245))
+    
+    # Create a grid for the content
+    $grid = New-Object System.Windows.Controls.Grid
+    $grid.Margin = New-Object System.Windows.Thickness(15)
+    
+    # Define row definitions
+    $row1 = New-Object System.Windows.Controls.RowDefinition
+    $row1.Height = [System.Windows.GridLength]::Auto
+    $row2 = New-Object System.Windows.Controls.RowDefinition
+    $row2.Height = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+    $row3 = New-Object System.Windows.Controls.RowDefinition
+    $row3.Height = [System.Windows.GridLength]::Auto
+    $grid.RowDefinitions.Add($row1)
+    $grid.RowDefinitions.Add($row2)
+    $grid.RowDefinitions.Add($row3)
+    
+    # Add a title
+    $titleBlock = New-Object System.Windows.Controls.TextBlock
+    $titleBlock.Text = "Password Presets"
+    $titleBlock.FontWeight = "Bold"
+    $titleBlock.FontSize = 14
+    $titleBlock.Margin = New-Object System.Windows.Thickness(0, 0, 0, 10)
+    [System.Windows.Controls.Grid]::SetRow($titleBlock, 0)
+    $grid.Children.Add($titleBlock)
+    
+    # Create a ListView for the presets
+    $listView = New-Object System.Windows.Controls.ListView
+    $listView.Margin = New-Object System.Windows.Thickness(0, 0, 0, 10)
+    [System.Windows.Controls.Grid]::SetRow($listView, 1)
+    
+    # Create GridView columns
+    $gridView = New-Object System.Windows.Controls.GridView
+    
+    # Name column
+    $nameColumn = New-Object System.Windows.Controls.GridViewColumn
+    $nameColumn.Header = "Name"
+    $nameColumn.Width = 150
+    $nameColumn.DisplayMemberBinding = New-Object System.Windows.Data.Binding("Name")
+    $gridView.Columns.Add($nameColumn)
+    
+    # Length column
+    $lengthColumn = New-Object System.Windows.Controls.GridViewColumn
+    $lengthColumn.Header = "Length"
+    $lengthColumn.Width = 60
+    $lengthColumn.DisplayMemberBinding = New-Object System.Windows.Data.Binding("Length")
+    $gridView.Columns.Add($lengthColumn)
+    
+    # Enabled column
+    $enabledColumn = New-Object System.Windows.Controls.GridViewColumn
+    $enabledColumn.Header = "Enabled"
+    $enabledColumn.Width = 70
+    
+    # Create a factory for the enabled column cells
+    $enabledFactory = New-Object System.Windows.FrameworkElementFactory([System.Windows.Controls.CheckBox])
+    $enabledFactory.SetBinding([System.Windows.Controls.CheckBox]::IsCheckedProperty, (New-Object System.Windows.Data.Binding("Enabled")))
+    $enabledFactory.SetValue([System.Windows.Controls.CheckBox]::HorizontalAlignmentProperty, [System.Windows.HorizontalAlignment]::Center)
+    
+    # Add click handler for the enabled checkbox
+    $enabledFactory.AddHandler(
+        [System.Windows.Controls.CheckBox]::ClickEvent,
+        [System.Windows.RoutedEventHandler]{
+            param($buttonSender, $e)
+            
+            # Get the preset from the DataContext
+            $preset = $buttonSender.DataContext
+            
+                # If trying to uncheck (disable)
+                if (-not $buttonSender.IsChecked) {
+                    # Count how many presets are currently enabled
+                    $enabledCount = ($script:PasswordPresets | Where-Object { $_.Enabled }).Count
+                    
+                    # If this is the last enabled preset, prevent unchecking
+                    if ($enabledCount -le 0) {
+                        $buttonSender.IsChecked = $true
+                        [System.Windows.MessageBox]::Show(
+                            "At least one preset must remain enabled.",
+                            "Cannot Disable All Presets",
+                            [System.Windows.MessageBoxButton]::OK,
+                            [System.Windows.MessageBoxImage]::Information
+                        )
+                        $e.Handled = $true
+                        return
+                    }
+                }
+            
+            # Update the preset's Enabled property
+            $preset.Enabled = $buttonSender.IsChecked
+            
+            # Save the changes to the presets file
+            Save-PasswordPresets
+            
+            # Update the presets dropdown to reflect the changes
+            Update-PresetsDropdown
+        }
+    )
+    
+    # Create the DataTemplate for the enabled column
+    $enabledTemplate = New-Object System.Windows.DataTemplate
+    $enabledTemplate.VisualTree = $enabledFactory
+    $enabledColumn.CellTemplate = $enabledTemplate
+    
+    $gridView.Columns.Add($enabledColumn)
+    
+    # Options columns
+    $uppercaseColumn = New-Object System.Windows.Controls.GridViewColumn
+    $uppercaseColumn.Header = "Uppercase"
+    $uppercaseColumn.Width = 80
+    
+    # Create a factory for the uppercase column cells
+    $uppercaseFactory = New-Object System.Windows.FrameworkElementFactory([System.Windows.Controls.CheckBox])
+    $uppercaseFactory.SetBinding([System.Windows.Controls.CheckBox]::IsCheckedProperty, (New-Object System.Windows.Data.Binding("IncludeUppercase")))
+    $uppercaseFactory.SetValue([System.Windows.Controls.CheckBox]::IsEnabledProperty, $false)
+    $uppercaseFactory.SetValue([System.Windows.Controls.CheckBox]::HorizontalAlignmentProperty, [System.Windows.HorizontalAlignment]::Center)
+    
+    # Create the DataTemplate for the uppercase column
+    $uppercaseTemplate = New-Object System.Windows.DataTemplate
+    $uppercaseTemplate.VisualTree = $uppercaseFactory
+    $uppercaseColumn.CellTemplate = $uppercaseTemplate
+    
+    $gridView.Columns.Add($uppercaseColumn)
+    
+    # Numbers column
+    $numbersColumn = New-Object System.Windows.Controls.GridViewColumn
+    $numbersColumn.Header = "Numbers"
+    $numbersColumn.Width = 80
+    
+    # Create a factory for the numbers column cells
+    $numbersFactory = New-Object System.Windows.FrameworkElementFactory([System.Windows.Controls.CheckBox])
+    $numbersFactory.SetBinding([System.Windows.Controls.CheckBox]::IsCheckedProperty, (New-Object System.Windows.Data.Binding("IncludeNumbers")))
+    $numbersFactory.SetValue([System.Windows.Controls.CheckBox]::IsEnabledProperty, $false)
+    $numbersFactory.SetValue([System.Windows.Controls.CheckBox]::HorizontalAlignmentProperty, [System.Windows.HorizontalAlignment]::Center)
+    
+    # Create the DataTemplate for the numbers column
+    $numbersTemplate = New-Object System.Windows.DataTemplate
+    $numbersTemplate.VisualTree = $numbersFactory
+    $numbersColumn.CellTemplate = $numbersTemplate
+    
+    $gridView.Columns.Add($numbersColumn)
+    
+    # Special column
+    $specialColumn = New-Object System.Windows.Controls.GridViewColumn
+    $specialColumn.Header = "Special"
+    $specialColumn.Width = 80
+    
+    # Create a factory for the special column cells
+    $specialFactory = New-Object System.Windows.FrameworkElementFactory([System.Windows.Controls.CheckBox])
+    $specialFactory.SetBinding([System.Windows.Controls.CheckBox]::IsCheckedProperty, (New-Object System.Windows.Data.Binding("IncludeSpecial")))
+    $specialFactory.SetValue([System.Windows.Controls.CheckBox]::IsEnabledProperty, $false)
+    $specialFactory.SetValue([System.Windows.Controls.CheckBox]::HorizontalAlignmentProperty, [System.Windows.HorizontalAlignment]::Center)
+    
+    # Create the DataTemplate for the special column
+    $specialTemplate = New-Object System.Windows.DataTemplate
+    $specialTemplate.VisualTree = $specialFactory
+    $specialColumn.CellTemplate = $specialTemplate
+    
+    $gridView.Columns.Add($specialColumn)
+    
+    # Set the GridView as the View for the ListView
+    $listView.View = $gridView
+    
+    # Add items to the ListView
+    foreach ($preset in $script:PasswordPresets) {
+        [void]$listView.Items.Add($preset)
+    }
+    
+    $grid.Children.Add($listView)
+    
+    # Add buttons panel
+    $buttonsPanel = New-Object System.Windows.Controls.StackPanel
+    $buttonsPanel.Orientation = "Horizontal"
+    $buttonsPanel.HorizontalAlignment = "Right"
+    $buttonsPanel.Margin = New-Object System.Windows.Thickness(0, 10, 0, 0)
+    [System.Windows.Controls.Grid]::SetRow($buttonsPanel, 2)
+    
+    # Add button
+    $addButton = New-Object System.Windows.Controls.Button
+    $addButton.Content = "Add"
+    $addButton.Width = 80
+    $addButton.Height = 30
+    $addButton.Margin = New-Object System.Windows.Thickness(0, 0, 10, 0)
+    $addButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 123, 255))
+    $addButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))
+    $addButton.Add_Click({
+        # Get current settings as a starting point
+        $preset = Get-CurrentSettings
+        $preset.Name = "New Preset"
+        
+        # Show edit dialog
+        $result = Show-PresetEditDialog -Preset $preset -IsNew $true
+        if ($result) {
+        # Add the new preset
+        $success = Add-PasswordPreset -Name $preset.Name -Length $preset.Length -IncludeUppercase $preset.IncludeUppercase -IncludeNumbers $preset.IncludeNumbers -IncludeSpecial $preset.IncludeSpecial -IsSelectedByDefault $preset.IsSelectedByDefault
+            
+            if ($success) {
+                # Refresh the ListView
+                $listView.Items.Clear()
+                foreach ($p in $script:PasswordPresets) {
+                    [void]$listView.Items.Add($p)
+                }
+            }
+        }
+    })
+    $buttonsPanel.Children.Add($addButton)
+    
+    # Edit button
+    $editButton = New-Object System.Windows.Controls.Button
+    $editButton.Content = "Edit"
+    $editButton.Width = 80
+    $editButton.Height = 30
+    $editButton.Margin = New-Object System.Windows.Thickness(0, 0, 10, 0)
+    $editButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 123, 255))
+    $editButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))
+    $editButton.Add_Click({
+        $selectedPreset = $listView.SelectedItem
+        if ($selectedPreset) {
+            # Check if it's a default preset
+            if ($selectedPreset.IsDefault) {
+                [System.Windows.MessageBox]::Show(
+                    "Default presets cannot be edited. You can create a new preset based on this one.",
+                    "Cannot Edit Default Preset",
+                    [System.Windows.MessageBoxButton]::OK,
+                    [System.Windows.MessageBoxImage]::Information
+                )
+                return
+            }
+            
+            # Clone the preset to avoid modifying the original until confirmed
+            $presetCopy = $selectedPreset.Clone()
+            
+            # Show edit dialog
+            $result = Show-PresetEditDialog -Preset $presetCopy -IsNew $false
+            if ($result) {
+                # Edit the existing preset
+                $success = Edit-PasswordPreset -OriginalName $selectedPreset.Name -NewName $presetCopy.Name -Length $presetCopy.Length -IncludeUppercase $presetCopy.IncludeUppercase -IncludeNumbers $presetCopy.IncludeNumbers -IncludeSpecial $presetCopy.IncludeSpecial -IsSelectedByDefault $presetCopy.IsSelectedByDefault
+                
+                if ($success) {
+                    # Refresh the ListView
+                    $listView.Items.Clear()
+                    foreach ($p in $script:PasswordPresets) {
+                        [void]$listView.Items.Add($p)
+                    }
+                }
+            }
+        }
+        else {
+            [System.Windows.MessageBox]::Show(
+                "Please select a preset to edit.",
+                "No Preset Selected",
+                [System.Windows.MessageBoxButton]::OK,
+                [System.Windows.MessageBoxImage]::Information
+            )
+        }
+    })
+    $buttonsPanel.Children.Add($editButton)
+    
+    # Delete button
+    $deleteButton = New-Object System.Windows.Controls.Button
+    $deleteButton.Content = "Delete"
+    $deleteButton.Width = 80
+    $deleteButton.Height = 30
+    $deleteButton.Margin = New-Object System.Windows.Thickness(0, 0, 10, 0)
+    $deleteButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(220, 53, 69))
+    $deleteButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))
+    $deleteButton.Add_Click({
+        $selectedPreset = $listView.SelectedItem
+        if ($selectedPreset) {
+            # Check if it's a default preset
+            if ($selectedPreset.IsDefault) {
+                [System.Windows.MessageBox]::Show(
+                    "Default presets cannot be deleted.",
+                    "Cannot Delete Default Preset",
+                    [System.Windows.MessageBoxButton]::OK,
+                    [System.Windows.MessageBoxImage]::Information
+                )
+                return
+            }
+            
+            # Confirm deletion
+            $confirmResult = [System.Windows.MessageBox]::Show(
+                "Are you sure you want to delete the preset '$($selectedPreset.Name)'?",
+                "Confirm Deletion",
+                [System.Windows.MessageBoxButton]::YesNo,
+                [System.Windows.MessageBoxImage]::Warning
+            )
+            
+            if ($confirmResult -eq [System.Windows.MessageBoxResult]::Yes) {
+                # Delete the preset
+                $success = Remove-PasswordPreset -Name $selectedPreset.Name
+                
+                if ($success) {
+                    # Refresh the ListView
+                    $listView.Items.Clear()
+                    foreach ($p in $script:PasswordPresets) {
+                        [void]$listView.Items.Add($p)
+                    }
+                }
+            }
+        }
+        else {
+            [System.Windows.MessageBox]::Show(
+                "Please select a preset to delete.",
+                "No Preset Selected",
+                [System.Windows.MessageBoxButton]::OK,
+                [System.Windows.MessageBoxImage]::Information
+            )
+        }
+    })
+    $buttonsPanel.Children.Add($deleteButton)
+    
+    # Close button
+    $closeButton = New-Object System.Windows.Controls.Button
+    $closeButton.Content = "Close"
+    $closeButton.Width = 80
+    $closeButton.Height = 30
+    $closeButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 123, 255))
+    $closeButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))
+    $closeButton.Add_Click({ $presetsWindow.Close() })
+    $buttonsPanel.Children.Add($closeButton)
+    
+    $grid.Children.Add($buttonsPanel)
+    
+    # Set the content and show the window
+    $presetsWindow.Content = $grid
+    $presetsWindow.ShowDialog() | Out-Null
+}
+
+# Shows a dialog for editing a password preset
+function Show-PresetEditDialog {
+    param (
+        [PasswordPresetModel]$Preset,
+        [bool]$IsNew = $false
+    )
+    
+    # Create a new window for editing the preset
+    $editWindow = New-Object System.Windows.Window
+    $editWindow.Title = if ($IsNew) { "Add Preset" } else { "Edit Preset" }
+    $editWindow.Width = 400
+    $editWindow.SizeToContent = "Height"
+    $editWindow.WindowStartupLocation = "CenterScreen"
+    $editWindow.ResizeMode = "NoResize"
+    $editWindow.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(245, 245, 245))
+    
+    # Create a grid for the content
+    $grid = New-Object System.Windows.Controls.Grid
+    $grid.Margin = New-Object System.Windows.Thickness(15)
+    
+    # Define row definitions
+    $row1 = New-Object System.Windows.Controls.RowDefinition
+    $row1.Height = [System.Windows.GridLength]::Auto
+    $row2 = New-Object System.Windows.Controls.RowDefinition
+    $row2.Height = [System.Windows.GridLength]::Auto
+    $row3 = New-Object System.Windows.Controls.RowDefinition
+    $row3.Height = [System.Windows.GridLength]::Auto
+    $row4 = New-Object System.Windows.Controls.RowDefinition
+    $row4.Height = [System.Windows.GridLength]::Auto
+    $grid.RowDefinitions.Add($row1)
+    $grid.RowDefinitions.Add($row2)
+    $grid.RowDefinitions.Add($row3)
+    $grid.RowDefinitions.Add($row4)
+    
+    # Name field
+    $nameLabel = New-Object System.Windows.Controls.Label
+    $nameLabel.Content = "Preset Name:"
+    $nameLabel.Margin = New-Object System.Windows.Thickness(0, 0, 0, 5)
+    [System.Windows.Controls.Grid]::SetRow($nameLabel, 0)
+    $grid.Children.Add($nameLabel)
+    
+    $nameTextBox = New-Object System.Windows.Controls.TextBox
+    $nameTextBox.Text = $Preset.Name
+    $nameTextBox.Height = 30
+    $nameTextBox.Margin = New-Object System.Windows.Thickness(0, 0, 0, 10)
+    $nameTextBox.VerticalContentAlignment = "Center"
+    [System.Windows.Controls.Grid]::SetRow($nameTextBox, 0)
+    $nameTextBox.Margin = New-Object System.Windows.Thickness(100, 0, 0, 10)
+    $grid.Children.Add($nameTextBox)
+    
+    # Length field
+    $lengthLabel = New-Object System.Windows.Controls.Label
+    $lengthLabel.Content = "Length:"
+    $lengthLabel.Margin = New-Object System.Windows.Thickness(0, 0, 0, 5)
+    [System.Windows.Controls.Grid]::SetRow($lengthLabel, 1)
+    $grid.Children.Add($lengthLabel)
+    
+    $lengthGrid = New-Object System.Windows.Controls.Grid
+    $lengthGrid.Margin = New-Object System.Windows.Thickness(100, 0, 0, 10)
+    [System.Windows.Controls.Grid]::SetRow($lengthGrid, 1)
+    
+    $lengthCol1 = New-Object System.Windows.Controls.ColumnDefinition
+    $lengthCol1.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+    $lengthCol2 = New-Object System.Windows.Controls.ColumnDefinition
+    $lengthCol2.Width = New-Object System.Windows.GridLength(40)
+    $lengthGrid.ColumnDefinitions.Add($lengthCol1)
+    $lengthGrid.ColumnDefinitions.Add($lengthCol2)
+    
+    $lengthSlider = New-Object System.Windows.Controls.Slider
+    $lengthSlider.Minimum = 8
+    $lengthSlider.Maximum = 32
+    $lengthSlider.Value = $Preset.Length
+    $lengthSlider.TickFrequency = 1
+    $lengthSlider.IsSnapToTickEnabled = $true
+    [System.Windows.Controls.Grid]::SetColumn($lengthSlider, 0)
+    $lengthGrid.Children.Add($lengthSlider)
+    
+    $lengthValue = New-Object System.Windows.Controls.TextBlock
+    $lengthValue.Text = $Preset.Length.ToString()
+    $lengthValue.VerticalAlignment = "Center"
+    $lengthValue.HorizontalAlignment = "Center"
+    [System.Windows.Controls.Grid]::SetColumn($lengthValue, 1)
+    $lengthGrid.Children.Add($lengthValue)
+    
+    $lengthSlider.Add_ValueChanged({
+        $lengthValue.Text = [int]$lengthSlider.Value
+    })
+    
+    $grid.Children.Add($lengthGrid)
+    
+    # Character options
+    $optionsLabel = New-Object System.Windows.Controls.Label
+    $optionsLabel.Content = "Options:"
+    $optionsLabel.Margin = New-Object System.Windows.Thickness(0, 0, 0, 5)
+    [System.Windows.Controls.Grid]::SetRow($optionsLabel, 2)
+    $grid.Children.Add($optionsLabel)
+    
+    $optionsPanel = New-Object System.Windows.Controls.StackPanel
+    $optionsPanel.Orientation = "Vertical"
+    $optionsPanel.Margin = New-Object System.Windows.Thickness(100, 0, 0, 10)
+    [System.Windows.Controls.Grid]::SetRow($optionsPanel, 2)
+    
+    $uppercaseCheck = New-Object System.Windows.Controls.CheckBox
+    $uppercaseCheck.Content = "Include Uppercase"
+    $uppercaseCheck.IsChecked = $Preset.IncludeUppercase
+    $uppercaseCheck.Margin = New-Object System.Windows.Thickness(0, 0, 0, 5)
+    $optionsPanel.Children.Add($uppercaseCheck)
+    
+    $numbersCheck = New-Object System.Windows.Controls.CheckBox
+    $numbersCheck.Content = "Include Numbers"
+    $numbersCheck.IsChecked = $Preset.IncludeNumbers
+    $numbersCheck.Margin = New-Object System.Windows.Thickness(0, 0, 0, 5)
+    $optionsPanel.Children.Add($numbersCheck)
+    
+    $specialCheck = New-Object System.Windows.Controls.CheckBox
+    $specialCheck.Content = "Include Special Characters"
+    $specialCheck.IsChecked = $Preset.IncludeSpecial
+    $specialCheck.Margin = New-Object System.Windows.Thickness(0, 0, 0, 5)
+    $optionsPanel.Children.Add($specialCheck)
+    
+    # Add default selection checkbox
+    $defaultSelectionCheck = New-Object System.Windows.Controls.CheckBox
+    $defaultSelectionCheck.Content = "Select by default on startup"
+    $defaultSelectionCheck.IsChecked = $Preset.IsSelectedByDefault
+    $defaultSelectionCheck.Margin = New-Object System.Windows.Thickness(0, 5, 0, 5)
+    $defaultSelectionCheck.ToolTip = "When checked, this preset will be automatically selected when the application starts"
+    $optionsPanel.Children.Add($defaultSelectionCheck)
+    
+    $grid.Children.Add($optionsPanel)
+    
+    # Buttons
+    $buttonsPanel = New-Object System.Windows.Controls.StackPanel
+    $buttonsPanel.Orientation = "Horizontal"
+    $buttonsPanel.HorizontalAlignment = "Right"
+    $buttonsPanel.Margin = New-Object System.Windows.Thickness(0, 10, 0, 0)
+    [System.Windows.Controls.Grid]::SetRow($buttonsPanel, 3)
+    
+    $saveButton = New-Object System.Windows.Controls.Button
+    $saveButton.Content = "Save"
+    $saveButton.Width = 80
+    $saveButton.Height = 30
+    $saveButton.Margin = New-Object System.Windows.Thickness(0, 0, 10, 0)
+    $saveButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 123, 255))
+    $saveButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))
+    
+    # Dialog result for returning to the caller
+    $dialogResult = $false
+    
+    $saveButton.Add_Click({
+        # Validate input
+        if ([string]::IsNullOrWhiteSpace($nameTextBox.Text)) {
+            [System.Windows.MessageBox]::Show(
+                "Preset name cannot be empty.",
+                "Validation Error",
+                [System.Windows.MessageBoxButton]::OK,
+                [System.Windows.MessageBoxImage]::Error
+            )
+            return
+        }
+        
+        # Check if at least one character set is selected
+        if (-not ($uppercaseCheck.IsChecked -or $numbersCheck.IsChecked -or $specialCheck.IsChecked)) {
+            [System.Windows.MessageBox]::Show(
+                "At least one character set must be selected.",
+                "Validation Error",
+                [System.Windows.MessageBoxButton]::OK,
+                [System.Windows.MessageBoxImage]::Error
+            )
+            return
+        }
+        
+        # Update the preset with the new values
+        $Preset.Name = $nameTextBox.Text
+        $Preset.Length = [int]$lengthSlider.Value
+        $Preset.IncludeUppercase = $uppercaseCheck.IsChecked
+        $Preset.IncludeNumbers = $numbersCheck.IsChecked
+        $Preset.IncludeSpecial = $specialCheck.IsChecked
+        $Preset.IsSelectedByDefault = $defaultSelectionCheck.IsChecked
+        
+        # Set the dialog result to true
+        $script:dialogResult = $true
+        
+        # Close the dialog
+        $editWindow.Close()
+    })
+    $buttonsPanel.Children.Add($saveButton)
+    
+    $cancelButton = New-Object System.Windows.Controls.Button
+    $cancelButton.Content = "Cancel"
+    $cancelButton.Width = 80
+    $cancelButton.Height = 30
+    $cancelButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(108, 117, 125))
+    $cancelButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))
+    $cancelButton.Add_Click({ $editWindow.Close() })
+    $buttonsPanel.Children.Add($cancelButton)
+    
+    $grid.Children.Add($buttonsPanel)
+    
+    # Set the content and show the window
+    $editWindow.Content = $grid
+    $editWindow.ShowDialog() | Out-Null
+    
+    # Return the dialog result
+    return $dialogResult
+}
+
+# Gets information about available updates from GitHub
+function Get-UpdateInformation {
+    [CmdletBinding()]
+    param()
+
+    try {
+        # GitHub API URL for releases
+        $apiUrl = "https://api.github.com/repos/onlyalex1984/securepassgenerator-powershell/releases"
+        $global:controls.LogOutput.AppendText("Checking for updates...`n")
+
+        # Check if GitHub API is available
+        if (-not (Test-ServiceAvailability -ServiceUrl "https://api.github.com")) {
+            $global:controls.LogOutput.AppendText("GitHub API: Service unavailable`n")
+            return @{
+                UpdateAvailable = $false
+                PreReleaseUpdateAvailable = $false
+                Error = "GitHub API: Service unavailable"
+            }
+        }
+
+        $global:controls.LogOutput.AppendText("Connecting to GitHub API: $apiUrl`n")
+
+        # Create a web request with specific headers and timeout
+        $webRequest = [System.Net.WebRequest]::Create($apiUrl)
+        $webRequest.Method = "GET"
+        $webRequest.Timeout = 10000 # 10 seconds timeout
+        $webRequest.UserAgent = "PowerShell-SecurePassGenerator"
+        
+        # Add Accept header using the proper method
+        $webRequest.Accept = "application/vnd.github.v3+json"
+
+        # Set proxy settings
+        $webRequest.Proxy = [System.Net.WebRequest]::DefaultWebProxy
+        $webRequest.Proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+
+        $global:controls.LogOutput.AppendText("Sending request to GitHub API...`n")
+        
+        try {
+            # Get the response
+            $response = $webRequest.GetResponse()
+            $responseStream = $response.GetResponseStream()
+            $reader = New-Object System.IO.StreamReader($responseStream)
+            $responseContent = $reader.ReadToEnd()
+            $reader.Close()
+            $response.Close()
+            
+            # Parse the JSON response
+            $releases = $responseContent | ConvertFrom-Json
+            $global:controls.LogOutput.AppendText("Successfully retrieved releases from GitHub`n")
+        }
+        catch [System.Net.WebException] {
+            $global:controls.LogOutput.AppendText("WebException: $($_.Exception.Message)`n")
+            
+            # Check if there's a response with error details
+            if ($_.Exception.Response) {
+                $errorResponse = $_.Exception.Response
+                $global:controls.LogOutput.AppendText("Status code: $($errorResponse.StatusCode)`n")
+                
+                # Try to read the error response body
+                try {
+                    $errorStream = $errorResponse.GetResponseStream()
+                    $errorReader = New-Object System.IO.StreamReader($errorStream)
+                    $errorContent = $errorReader.ReadToEnd()
+                    $errorReader.Close()
+                    $global:controls.LogOutput.AppendText("Error details: $errorContent`n")
+                }
+                catch {
+                    $global:controls.LogOutput.AppendText("Could not read error response: $($_.Exception.Message)`n")
+                }
+            }
+            
+            # Try alternative approach with Invoke-WebRequest
+            $global:controls.LogOutput.AppendText("Trying alternative approach with Invoke-WebRequest...`n")
+            try {
+                $releases = Invoke-RestMethod -Uri $apiUrl -Method Get -UserAgent "PowerShell-SecurePassGenerator" -TimeoutSec 10
+                $global:controls.LogOutput.AppendText("Successfully retrieved releases using Invoke-RestMethod`n")
+            }
+            catch {
+                $global:controls.LogOutput.AppendText("Alternative approach failed: $($_.Exception.Message)`n")
+                throw
+            }
+        }
+
+        # Find latest stable release
+        $latestRelease = $releases | Where-Object { -not $_.prerelease } | Select-Object -First 1
+        if (-not $latestRelease) {
+            $global:controls.LogOutput.AppendText("No stable releases found`n")
+            throw "No stable releases found"
+        }
+
+        # Find latest pre-release
+        $latestPreRelease = $releases | Where-Object { $_.prerelease } | Select-Object -First 1
+
+        # Parse version numbers for comparison
+        $currentVersion = [Version]$script:Version
+        $global:controls.LogOutput.AppendText("Current version: $currentVersion`n")
+        
+        # Check if tag_name exists and has a valid format
+        if (-not $latestRelease.tag_name) {
+            $global:controls.LogOutput.AppendText("Error: Latest release has no tag_name`n")
+            throw "Latest release has no tag_name"
+        }
+        
+        # Remove 'v' prefix if present and parse version
+        $latestVersionString = $latestRelease.tag_name -replace '^v', ''
+        try {
+            $latestVersion = [Version]$latestVersionString
+            $global:controls.LogOutput.AppendText("Latest stable version: $latestVersion`n")
+        }
+        catch {
+            $global:controls.LogOutput.AppendText("Error parsing version from tag: $latestVersionString`n")
+            throw "Invalid version format in tag_name: $($latestRelease.tag_name)"
+        }
+        
+        # Parse pre-release version if available
+        $preReleaseVersion = $null
+        if ($latestPreRelease -and $latestPreRelease.tag_name) {
+            $preReleaseVersionString = $latestPreRelease.tag_name -replace '^v', ''
+            
+            # Handle pre-release version tags like "1.1.0-pre.1"
+            if ($preReleaseVersionString -match '(\d+\.\d+\.\d+)(-\w+\.\d+)?') {
+                $versionPart = $matches[1]
+                try {
+                    $preReleaseVersion = [Version]$versionPart
+                    $global:controls.LogOutput.AppendText("Latest pre-release version: $preReleaseVersion (from tag: $preReleaseVersionString)`n")
+                }
+                catch {
+                    $global:controls.LogOutput.AppendText("Error parsing pre-release version part: $versionPart from tag: $preReleaseVersionString`n")
+                    # Don't throw here, just ignore the pre-release
+                    $preReleaseVersion = $null
+                }
+            } else {
+                try {
+                    # Fallback to direct parsing if the regex doesn't match
+                    $preReleaseVersion = [Version]$preReleaseVersionString
+                    $global:controls.LogOutput.AppendText("Latest pre-release version: $preReleaseVersion`n")
+                }
+                catch {
+                    $global:controls.LogOutput.AppendText("Error parsing pre-release version from tag: $preReleaseVersionString`n")
+                    # Don't throw here, just ignore the pre-release
+                    $preReleaseVersion = $null
+                }
+            }
+        }
+
+        # Determine if updates are available
+        $updateAvailable = $latestVersion -gt $currentVersion
+        $preReleaseUpdateAvailable = $preReleaseVersion -and ($preReleaseVersion -gt $currentVersion)
+
+        $global:controls.LogOutput.AppendText("Update available: $updateAvailable`n")
+        $global:controls.LogOutput.AppendText("Pre-release update available: $preReleaseUpdateAvailable`n")
+
+        # Return the update information
+        return @{
+            CurrentVersion = $currentVersion
+            LatestVersion = $latestVersion
+            LatestRelease = $latestRelease
+            PreReleaseVersion = $preReleaseVersion
+            PreRelease = $latestPreRelease
+            UpdateAvailable = $updateAvailable
+            PreReleaseUpdateAvailable = $preReleaseUpdateAvailable
+        }
+    }
+    catch {
+        $errorMessage = $_.Exception.Message
+        $global:controls.LogOutput.AppendText("Error checking for updates: $errorMessage`n")
+        
+        # Check if the error is related to connectivity issues
+        if ($errorMessage -like "*Det gick inte att matcha fjärrnamnet*" -or 
+            $errorMessage -like "*Could not resolve host*" -or 
+            $errorMessage -like "*No such host is known*" -or
+            $errorMessage -like "*Unable to connect*" -or
+            $errorMessage -like "*The remote name could not be resolved*") {
+            return @{
+                UpdateAvailable = $false
+                PreReleaseUpdateAvailable = $false
+                Error = "GitHub API: Service unavailable"
+            }
+        }
+        
+        $global:controls.LogOutput.AppendText("Stack trace: $($_.ScriptStackTrace)`n")
+        return @{
+            UpdateAvailable = $false
+            PreReleaseUpdateAvailable = $false
+            Error = $errorMessage
+        }
+    }
+}
+
+# Shows changelog information for a specific version by downloading from GitHub
+function Show-Changelog {
+    param (
+        [string]$Version
+    )
+    
+    # Create a new window for the changelog
+    $changelogWindow = New-Object System.Windows.Window
+    $changelogWindow.Title = "Changelog for $Version"
+    $changelogWindow.Width = 600
+    $changelogWindow.Height = 500
+    $changelogWindow.WindowStartupLocation = "CenterScreen"
+    $changelogWindow.ResizeMode = "CanResize"
+    $changelogWindow.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(245, 245, 245))
+    
+    # Create a grid for the content
+    $grid = New-Object System.Windows.Controls.Grid
+    $grid.Margin = New-Object System.Windows.Thickness(15)
+    
+    # Define row definitions
+    $row1 = New-Object System.Windows.Controls.RowDefinition
+    $row1.Height = [System.Windows.GridLength]::Auto
+    $row2 = New-Object System.Windows.Controls.RowDefinition
+    $row2.Height = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+    $row3 = New-Object System.Windows.Controls.RowDefinition
+    $row3.Height = [System.Windows.GridLength]::Auto
+    $grid.RowDefinitions.Add($row1)
+    $grid.RowDefinitions.Add($row2)
+    $grid.RowDefinitions.Add($row3)
+    
+    # Add a title
+    $titleBlock = New-Object System.Windows.Controls.TextBlock
+    $titleBlock.Text = "Changelog for $Version"
+    $titleBlock.FontWeight = "Bold"
+    $titleBlock.FontSize = 16
+    $titleBlock.Margin = New-Object System.Windows.Thickness(0, 0, 0, 10)
+    $titleBlock.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 120, 215))
+    [System.Windows.Controls.Grid]::SetRow($titleBlock, 0)
+    $grid.Children.Add($titleBlock)
+    
+    # Create a ScrollViewer for the changelog content
+    $scrollViewer = New-Object System.Windows.Controls.ScrollViewer
+    $scrollViewer.VerticalScrollBarVisibility = "Auto"
+    $scrollViewer.Margin = New-Object System.Windows.Thickness(0, 0, 0, 10)
+    [System.Windows.Controls.Grid]::SetRow($scrollViewer, 1)
+    
+    # Create a TextBlock for the changelog content
+    $changelogContent = New-Object System.Windows.Controls.TextBlock
+    $changelogContent.TextWrapping = "Wrap"
+    $changelogContent.Margin = New-Object System.Windows.Thickness(5)
+    
+    # Set initial loading message
+    $changelogContent.Text = "Loading changelog from GitHub..."
+    
+    # Add the TextBlock to the ScrollViewer
+    $scrollViewer.Content = $changelogContent
+    $grid.Children.Add($scrollViewer)
+    
+    # Add a close button
+    $closeButton = New-Object System.Windows.Controls.Button
+    $closeButton.Content = "Close"
+    $closeButton.Width = 80
+    $closeButton.Height = 30
+    $closeButton.HorizontalAlignment = "Right"
+    $closeButton.Margin = New-Object System.Windows.Thickness(0, 10, 0, 0)
+    $closeButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 123, 255))
+    $closeButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))
+    $closeButton.Add_Click({ $changelogWindow.Close() })
+    [System.Windows.Controls.Grid]::SetRow($closeButton, 2)
+    $grid.Children.Add($closeButton)
+    
+    # Set the content and show the window
+    $changelogWindow.Content = $grid
+    
+    # Start a background job to download and process the changelog
+    $dispatcher = $changelogWindow.Dispatcher
+    $dispatcher.InvokeAsync([System.Action]{
+        try {
+            # Determine the appropriate branch based on the version
+            $branch = "main"
+            # Check if the version contains a pre-release indicator (like -pre, -alpha, -beta, etc.)
+            if ($Version -match "-") {
+                $branch = "prerelease"
+                $global:controls.LogOutput.AppendText("Detected pre-release version, using prerelease branch`n")
+            }
+            
+            # Download the CHANGELOG.md file from GitHub
+            $changelogUrl = "https://raw.githubusercontent.com/onlyalex1984/securepassgenerator-powershell/$branch/CHANGELOG.md"
+            $global:controls.LogOutput.AppendText("Downloading changelog from: $changelogUrl`n")
+            
+            # Create a web request with specific headers and timeout
+            $webRequest = [System.Net.WebRequest]::Create($changelogUrl)
+            $webRequest.Method = "GET"
+            $webRequest.Timeout = 10000 # 10 seconds timeout
+            $webRequest.UserAgent = "PowerShell-SecurePassGenerator"
+            
+            # Set proxy settings
+            $webRequest.Proxy = [System.Net.WebRequest]::DefaultWebProxy
+            $webRequest.Proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+            
+            # Get the response
+            $response = $webRequest.GetResponse()
+            $responseStream = $response.GetResponseStream()
+            $reader = New-Object System.IO.StreamReader($responseStream)
+            $changelogText = $reader.ReadToEnd()
+            $reader.Close()
+            $response.Close()
+            
+            $global:controls.LogOutput.AppendText("Successfully downloaded changelog from GitHub`n")
+            
+            # Log a simple message about showing the changelog
+            $global:controls.LogOutput.AppendText("Showing changelog for version $Version`n")
+            
+            # Try different regex patterns to find the version
+            $versionPattern = "## \[$Version\].*?(?=## \[|$)"
+            
+            if ($changelogText -match $versionPattern) {
+                $versionChangelog = $matches[0]
+                # No need to log the length of the changelog section
+                
+                # Format the changelog text - ensure proper encoding of special characters
+                # First replace section headers, then replace bullet points with proper Unicode character
+                $formattedChangelog = $versionChangelog -replace "### (.*)", "`n`${1}:" -replace "- ", ([char]0x2022 + " ")
+                
+                # Update the UI on the UI thread
+                $dispatcher.Invoke([System.Action]{
+                    # Set the text with proper encoding
+                    $changelogContent.Text = $formattedChangelog.Trim()
+                })
+            } 
+            # Try a simpler pattern as fallback
+            elseif ($changelogText -match "(?s)## \[$Version\](.*?)(?=## \[|$)") {
+                $versionChangelog = $matches[0]
+                # No need to log the fallback pattern details
+                
+                # Format the changelog text - ensure proper encoding of special characters
+                # First replace section headers, then replace bullet points with proper Unicode character
+                $formattedChangelog = $versionChangelog -replace "### (.*)", "`n`${1}:" -replace "- ", ([char]0x2022 + " ")
+                
+                # Update the UI on the UI thread
+                $dispatcher.Invoke([System.Action]{
+                    # Set the text with proper encoding
+                    $changelogContent.Text = $formattedChangelog.Trim()
+                })
+            }
+            # Try an exact string search as a last resort
+            elseif ($changelogText.Contains("## [$Version]")) {
+                $global:controls.LogOutput.AppendText("Found version header but couldn't extract section. Using string search.`n")
+                
+                # Split the changelog by sections and find the one for our version
+                $sections = $changelogText -split "## \["
+                foreach ($section in $sections) {
+                    if ($section.StartsWith("$Version]")) {
+                        $versionChangelog = "## [$section"
+                        # Truncate at the next section if present
+                        $nextSectionIndex = $versionChangelog.IndexOf("## [", 5)
+                        if ($nextSectionIndex -gt 0) {
+                            $versionChangelog = $versionChangelog.Substring(0, $nextSectionIndex)
+                        }
+                        
+                        # No need to log extraction details
+                        
+                # Format the changelog text - ensure proper encoding of special characters
+                # First replace section headers, then replace bullet points with proper Unicode character
+                $formattedChangelog = $versionChangelog -replace "### (.*)", "`n`${1}:" -replace "- ", ([char]0x2022 + " ")
+                
+                # Update the UI on the UI thread
+                $dispatcher.Invoke([System.Action]{
+                    # Set the text with proper encoding
+                    $changelogContent.Text = $formattedChangelog.Trim()
+                })
+                        break
+                    }
+                }
+            }
+            else {
+                $global:controls.LogOutput.AppendText("No changelog information found for version $Version`n")
+                
+                # Update the UI on the UI thread
+                $dispatcher.Invoke([System.Action]{
+                    $changelogContent.Text = "No changelog information found for version $Version."
+                })
+            }
+        } catch {
+            # Log a simple error message
+            $global:controls.LogOutput.AppendText("Error downloading changelog: $($_.Exception.Message)`n")
+            
+            # Update the UI on the UI thread
+            $dispatcher.Invoke([System.Action]{
+                $changelogContent.Text = "Error downloading changelog: $($_.Exception.Message)"
+            })
+            
+            # Try alternative approach with Invoke-WebRequest
+            try {
+                $global:controls.LogOutput.AppendText("Retrying download...`n")
+                $changelogText = Invoke-WebRequest -Uri $changelogUrl -UseBasicParsing | Select-Object -ExpandProperty Content
+                
+                # Extract the section for the specified version
+                $versionPattern = "## \[$Version\].*?(?=## \[|$)"
+                if ($changelogText -match $versionPattern) {
+                    $versionChangelog = $matches[0]
+                    
+                    # Format the changelog text
+                    $formattedChangelog = $versionChangelog -replace "### (.*)", "`n`${1}:" -replace "- ", "• "
+                    
+                    # Update the UI on the UI thread
+                    $dispatcher.Invoke([System.Action]{
+                        $changelogContent.Text = $formattedChangelog.Trim()
+                    })
+                } else {
+                    # Update the UI on the UI thread
+                    $dispatcher.Invoke([System.Action]{
+                        $changelogContent.Text = "No changelog information found for version $Version."
+                    })
+                }
+                
+                $global:controls.LogOutput.AppendText("Successfully downloaded changelog for version $Version`n")
+            } catch {
+                # Log a simple error message for the retry failure
+                $global:controls.LogOutput.AppendText("Retry failed: $($_.Exception.Message)`n")
+                
+                # Update the UI on the UI thread
+                $dispatcher.Invoke([System.Action]{
+                    $changelogContent.Text = "Error downloading changelog: $($_.Exception.Message)"
+                })
+            }
+        }
+    })
+    
+    # Show the window
+    $changelogWindow.ShowDialog() | Out-Null
+}
+
+# Shows a dialog with update information and options
+function Show-UpdateDialog {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [PSObject]$UpdateInfo
+    )
+
+    # Create update dialog window
+    $updateWindow = New-Object System.Windows.Window
+    $updateWindow.Title = "SecurePassGenerator Update"
+    $updateWindow.Width = 450
+    $updateWindow.Height = 400
+    $updateWindow.WindowStartupLocation = "CenterScreen"
+    $updateWindow.ResizeMode = "NoResize"
+    $updateWindow.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(245, 245, 245))
+
+    # Create content
+    $stackPanel = New-Object System.Windows.Controls.StackPanel
+    $stackPanel.Margin = New-Object System.Windows.Thickness(15)
+
+    # Add title
+    $titleBlock = New-Object System.Windows.Controls.TextBlock
+    $titleBlock.Text = "SecurePassGenerator Update"
+    $titleBlock.FontSize = 16
+    $titleBlock.FontWeight = "Bold"
+    $titleBlock.Margin = New-Object System.Windows.Thickness(0, 0, 0, 15)
+    $titleBlock.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 120, 215))
+    $stackPanel.Children.Add($titleBlock)
+
+    # Add current version info
+    $currentVersionText = New-Object System.Windows.Controls.TextBlock
+    $currentVersionText.Text = "Current Version: $($UpdateInfo.CurrentVersion)"
+    $currentVersionText.Margin = New-Object System.Windows.Thickness(0, 0, 0, 10)
+    $currentVersionText.FontWeight = "SemiBold"
+    $stackPanel.Children.Add($currentVersionText)
+
+    # Add latest stable version info
+    $latestVersionText = New-Object System.Windows.Controls.TextBlock
+    $latestVersionText.Text = "Latest Stable Version: $($UpdateInfo.LatestVersion)"
+    $latestVersionText.Margin = New-Object System.Windows.Thickness(0, 0, 0, 5)
+    $stackPanel.Children.Add($latestVersionText)
+    
+        # Add latest pre-release version info if available
+        if ($UpdateInfo.PreReleaseVersion) {
+            # Get the full pre-release tag (including -pre.X suffix)
+            $fullPreReleaseTag = $UpdateInfo.PreRelease.tag_name -replace '^v', ''
+            
+            # Create a grid for pre-release version info with changelog button
+            $preReleaseGrid = New-Object System.Windows.Controls.Grid
+            $preReleaseGrid.Margin = New-Object System.Windows.Thickness(0, 0, 0, 15)
+            
+            # Define columns for the grid
+            $col1 = New-Object System.Windows.Controls.ColumnDefinition
+            $col1.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+            $col2 = New-Object System.Windows.Controls.ColumnDefinition
+            $col2.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Auto)
+            $preReleaseGrid.ColumnDefinitions.Add($col1)
+            $preReleaseGrid.ColumnDefinitions.Add($col2)
+            
+            # Add pre-release version text
+            $preReleaseVersionText = New-Object System.Windows.Controls.TextBlock
+            $preReleaseVersionText.Text = "Latest Pre-Release Version: $fullPreReleaseTag"
+            $preReleaseVersionText.VerticalAlignment = "Center"
+            [System.Windows.Controls.Grid]::SetColumn($preReleaseVersionText, 0)
+            $preReleaseGrid.Children.Add($preReleaseVersionText)
+            
+            # Add Show Changelog button
+            $showChangelogButton = New-Object System.Windows.Controls.Button
+            $showChangelogButton.Content = "Show Changelog"
+            $showChangelogButton.Padding = New-Object System.Windows.Thickness(5, 2, 5, 2)
+            $showChangelogButton.Margin = New-Object System.Windows.Thickness(10, 0, 0, 0)
+            $showChangelogButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 123, 255))
+            $showChangelogButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))
+            $showChangelogButton.Add_Click({
+                Show-Changelog -Version $fullPreReleaseTag
+            })
+            [System.Windows.Controls.Grid]::SetColumn($showChangelogButton, 1)
+            $preReleaseGrid.Children.Add($showChangelogButton)
+            
+            # Add the grid to the main stack panel
+            $stackPanel.Children.Add($preReleaseGrid)
+        }
+
+    # Determine version status
+    $runningNewerThanStable = $UpdateInfo.CurrentVersion -gt $UpdateInfo.LatestVersion
+
+    # Add update button for stable version if update is available
+    if ($UpdateInfo.UpdateAvailable) {
+        $updateButton = New-Object System.Windows.Controls.Button
+        $updateButton.Content = "Update to Latest Stable Version ($($UpdateInfo.LatestVersion))"
+        $updateButton.Margin = New-Object System.Windows.Thickness(0, 5, 0, 15)
+        $updateButton.Padding = New-Object System.Windows.Thickness(10, 5, 10, 5)
+        $updateButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 123, 255))
+        $updateButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))
+        $updateButton.Add_Click({
+            $updateWindow.DialogResult = $true
+            $updateWindow.Tag = "Latest"
+            $updateWindow.Close()
+        })
+        $stackPanel.Children.Add($updateButton)
+    }
+    elseif ($runningNewerThanStable) {
+    # Add option to install stable version
+        $installButton = New-Object System.Windows.Controls.Button
+        $installButton.Content = "Install Latest Stable Version ($($UpdateInfo.LatestVersion))"
+        $installButton.Margin = New-Object System.Windows.Thickness(0, 5, 0, 15)
+        $installButton.Padding = New-Object System.Windows.Thickness(10, 5, 10, 5)
+        $installButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(40, 167, 69)) # Green color
+        $installButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))
+        $installButton.Add_Click({
+            $updateWindow.DialogResult = $true
+            $updateWindow.Tag = "Latest"
+            $updateWindow.Close()
+        })
+        $stackPanel.Children.Add($installButton)
+    }
+    else {
+        $upToDateText = New-Object System.Windows.Controls.TextBlock
+        $upToDateText.Text = "You have the latest stable version."
+        $upToDateText.Margin = New-Object System.Windows.Thickness(0, 5, 0, 15)
+        $upToDateText.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 128, 0))
+        $stackPanel.Children.Add($upToDateText)
+        
+        # Add option to reinstall stable version
+        $reinstallButton = New-Object System.Windows.Controls.Button
+        $reinstallButton.Content = "Reinstall Latest Stable Version ($($UpdateInfo.LatestVersion))"
+        $reinstallButton.Margin = New-Object System.Windows.Thickness(0, 5, 0, 15)
+        $reinstallButton.Padding = New-Object System.Windows.Thickness(10, 5, 10, 5)
+        $reinstallButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(40, 167, 69)) # Green color
+        $reinstallButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))
+        $reinstallButton.Add_Click({
+            $updateWindow.DialogResult = $true
+            $updateWindow.Tag = "Latest"
+            $updateWindow.Close()
+        })
+        $stackPanel.Children.Add($reinstallButton)
+    }
+
+    # Add separator
+    $separator = New-Object System.Windows.Controls.Separator
+    $separator.Margin = New-Object System.Windows.Thickness(0, 0, 0, 10)
+    $stackPanel.Children.Add($separator)
+
+    # Add pre-release update options if available
+    if ($UpdateInfo.PreReleaseVersion) {
+        # Get the full pre-release tag (including -pre.X suffix)
+        $fullPreReleaseTag = $UpdateInfo.PreRelease.tag_name -replace '^v', ''
+
+        # Add update button for pre-release if newer than current
+        if ($UpdateInfo.PreReleaseUpdateAvailable) {
+            $preReleaseUpdateButton = New-Object System.Windows.Controls.Button
+            $preReleaseUpdateButton.Content = "Update to Pre-Release Version ($fullPreReleaseTag)"
+            $preReleaseUpdateButton.Margin = New-Object System.Windows.Thickness(0, 5, 0, 15)
+            $preReleaseUpdateButton.Padding = New-Object System.Windows.Thickness(10, 5, 10, 5)
+            $preReleaseUpdateButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 165, 0))
+            $preReleaseUpdateButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))
+            $preReleaseUpdateButton.Add_Click({
+                $updateWindow.DialogResult = $true
+                $updateWindow.Tag = "PreRelease"
+                $updateWindow.Close()
+            })
+            $stackPanel.Children.Add($preReleaseUpdateButton)
+
+            # Add warning about pre-release versions
+            $preReleaseWarningText = New-Object System.Windows.Controls.TextBlock
+            $preReleaseWarningText.Text = "Warning: Pre-release versions may contain bugs or incomplete features."
+            $preReleaseWarningText.Margin = New-Object System.Windows.Thickness(0, 0, 0, 10)
+            $preReleaseWarningText.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 165, 0))
+            $preReleaseWarningText.TextWrapping = "Wrap"
+            $stackPanel.Children.Add($preReleaseWarningText)
+        }
+        else {
+            # If pre-release is not newer, still offer option to switch to it
+            $switchToPreReleaseButton = New-Object System.Windows.Controls.Button
+            $switchToPreReleaseButton.Content = "Switch to Pre-Release Version ($fullPreReleaseTag)"
+            $switchToPreReleaseButton.Margin = New-Object System.Windows.Thickness(0, 5, 0, 15)
+            $switchToPreReleaseButton.Padding = New-Object System.Windows.Thickness(10, 5, 10, 5)
+            $switchToPreReleaseButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 123, 255)) # Blue color
+            $switchToPreReleaseButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))
+            $switchToPreReleaseButton.Add_Click({
+                $updateWindow.DialogResult = $true
+                $updateWindow.Tag = "PreRelease"
+                $updateWindow.Close()
+            })
+            $stackPanel.Children.Add($switchToPreReleaseButton)
+            
+            # Add warning about pre-release versions
+            $preReleaseWarningText = New-Object System.Windows.Controls.TextBlock
+            $preReleaseWarningText.Text = "Warning: Pre-release versions may contain bugs or incomplete features."
+            $preReleaseWarningText.Margin = New-Object System.Windows.Thickness(0, 0, 0, 10)
+            $preReleaseWarningText.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 165, 0))
+            $preReleaseWarningText.TextWrapping = "Wrap"
+            $stackPanel.Children.Add($preReleaseWarningText)
+        }
+    }
+    else {
+        $noPreReleaseText = New-Object System.Windows.Controls.TextBlock
+        $noPreReleaseText.Text = "No pre-release versions available."
+        $noPreReleaseText.Margin = New-Object System.Windows.Thickness(0, 5, 0, 15)
+        $stackPanel.Children.Add($noPreReleaseText)
+    }
+
+    # Add close button
+    $closeButton = New-Object System.Windows.Controls.Button
+    $closeButton.Content = "Close"
+    $closeButton.Margin = New-Object System.Windows.Thickness(0, 10, 0, 0)
+    $closeButton.Padding = New-Object System.Windows.Thickness(10, 5, 10, 5)
+    $closeButton.HorizontalAlignment = "Right"
+    $closeButton.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0, 123, 255)) # Blue color
+    $closeButton.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(255, 255, 255))
+    $closeButton.Add_Click({
+        $updateWindow.DialogResult = $false
+        $updateWindow.Close()
+    })
+    $stackPanel.Children.Add($closeButton)
+
+    # Set content and show dialog
+    $updateWindow.Content = $stackPanel
+    $result = $updateWindow.ShowDialog()
+    
+    # Return both the dialog result and the selected release type
+    return @{
+        Result = $result
+        ReleaseType = $updateWindow.Tag
+    }
+}
+
+# Downloads and executes the installer with appropriate parameters
+function Invoke-Update {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Latest", "PreRelease")]
+        [string]$ReleaseType
+    )
+
+    try {
+        # Variable to track if we're using a temporary installer
+        $usingTempInstaller = $false
+        $tempInstallerPath = $null
+        
+        # 1. Check if installer exists in the same directory as the script
+        $currentDirInstallerPath = Join-Path -Path $PSScriptRoot -ChildPath "Installer.ps1"
+        if (Test-Path -Path $currentDirInstallerPath) {
+            $installerPath = $currentDirInstallerPath
+            $global:controls.LogOutput.AppendText("Found installer in current directory: $installerPath`n")
+        }
+        # 2. Check in AppData directory
+        elseif (Test-Path -Path $script:InstallerPath) {
+            $installerPath = $script:InstallerPath
+            $global:controls.LogOutput.AppendText("Found installer in AppData directory: $installerPath`n")
+        }
+        # 3. Check tools\installer directory
+        elseif (Test-Path -Path (Join-Path -Path $PSScriptRoot -ChildPath "tools\installer\Installer.ps1")) {
+            $installerPath = Join-Path -Path $PSScriptRoot -ChildPath "tools\installer\Installer.ps1"
+            $global:controls.LogOutput.AppendText("Found installer in tools\installer directory: $installerPath`n")
+        }
+        # 4. If not found in any location, download from GitHub to temp directory
+        else {
+            $global:controls.LogOutput.AppendText("Installer not found locally, downloading from GitHub to temp directory...`n")
+
+            # Create a dedicated temp directory for the installer
+            $tempDir = Join-Path -Path $env:TEMP -ChildPath "securepassgenerator"
+            if (-not (Test-Path -Path $tempDir)) {
+                New-Item -Path $tempDir -ItemType Directory -Force | Out-Null
+                $global:controls.LogOutput.AppendText("Created temporary directory: $tempDir`n")
+            }
+            
+            # Use the original file name in the temp directory
+            $tempInstallerPath = Join-Path -Path $tempDir -ChildPath "Installer.ps1"
+            $installerPath = $tempInstallerPath
+            $usingTempInstaller = $true
+            
+            # Download installer from GitHub to temp location
+            $installerUrl = "https://raw.githubusercontent.com/onlyalex1984/securepassgenerator-powershell/main/tools/installer/Installer.ps1"
+            $global:controls.LogOutput.AppendText("Downloading installer from: $installerUrl`n")
+            Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath
+
+            # Unblock the file to prevent security warnings
+            Unblock-File -Path $installerPath
+            $global:controls.LogOutput.AppendText("Installer downloaded and unblocked successfully to: $installerPath`n")
+        }
+
+        # Prepare the update command
+        $updateCommand = "powershell.exe -ExecutionPolicy Bypass -File `"$installerPath`" -InstallType DirectAPI -ReleaseType $ReleaseType"
+        $global:controls.LogOutput.AppendText("Update command: $updateCommand`n")
+
+        # Show confirmation dialog
+        $confirmResult = [System.Windows.MessageBox]::Show(
+            "Are you sure you want to update to the $ReleaseType version? The application will close during the update process.",
+            "Confirm Update",
+            [System.Windows.MessageBoxButton]::YesNo,
+            [System.Windows.MessageBoxImage]::Question
+        )
+
+        if ($confirmResult -eq [System.Windows.MessageBoxResult]::Yes) {
+            # Execute the installer
+            $global:controls.LogOutput.AppendText("Starting update process...`n")
+            Start-Process -FilePath "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -File `"$installerPath`" -InstallType DirectAPI -ReleaseType $ReleaseType" -Wait
+
+            # Clean up the temporary installer file if we used one
+            if ($usingTempInstaller -and (Test-Path -Path $tempInstallerPath)) {
+                Remove-Item -Path $tempInstallerPath -Force -ErrorAction SilentlyContinue
+                $global:controls.LogOutput.AppendText("Temporary installer file removed`n")
+            }
+
+            # Inform the user that the application will close
+            [System.Windows.MessageBox]::Show(
+                "Update process completed. The application will now close. Please restart SecurePassGenerator after the update.",
+                "Update Complete",
+                [System.Windows.MessageBoxButton]::OK,
+                [System.Windows.MessageBoxImage]::Information
+            )
+
+            # Close the application
+            $window.Close()
+        }
+        else {
+            $global:controls.LogOutput.AppendText("Update cancelled by user`n")
+            
+            # Clean up the temporary installer file if we used one and the update was cancelled
+            if ($usingTempInstaller -and (Test-Path -Path $tempInstallerPath)) {
+                Remove-Item -Path $tempInstallerPath -Force -ErrorAction SilentlyContinue
+                $global:controls.LogOutput.AppendText("Temporary installer file removed`n")
+            }
+        }
+    }
+    catch {
+        $global:controls.LogOutput.AppendText("Error during update: $($_.Exception.Message)`n")
+        
+        # Clean up the temporary installer file if we used one and there was an error
+        if ($usingTempInstaller -and $tempInstallerPath -and (Test-Path -Path $tempInstallerPath)) {
+            Remove-Item -Path $tempInstallerPath -Force -ErrorAction SilentlyContinue
+            $global:controls.LogOutput.AppendText("Temporary installer file removed`n")
+        }
+        
+        [System.Windows.MessageBox]::Show(
+            "An error occurred during the update process: $($_.Exception.Message)",
+            "Update Error",
+            [System.Windows.MessageBoxButton]::OK,
+            [System.Windows.MessageBoxImage]::Error
+        )
     }
 }
 
@@ -832,34 +2583,135 @@ function Test-ServiceAvailability {
     )
 
     try {
-        # Extract the hostname from the URL
-        $uri = [System.Uri]$ServiceUrl
-        $hostname = $uri.Host
-
-        # Try to resolve the hostname and check connectivity
-        $result = Test-Connection -ComputerName $hostname -Count 1 -Quiet
-        
-        # If Test-Connection succeeds, try a more direct HTTP check
-        if ($result) {
+        # For HIBP API, we'll use a different approach since it doesn't respond to HEAD requests
+        if ($ServiceUrl -like "*pwnedpasswords.com*") {
+            $controls.LogOutput.AppendText("Testing HIBP API availability with a direct GET request`n")
+            
+            # Use a direct GET request to the API with a known prefix
+            # This is a more reliable way to check if the API is available
+            $testPrefix = "00000" # A simple prefix that will return minimal data
+            $testUrl = "https://api.pwnedpasswords.com/range/$testPrefix"
+            
             try {
-                # Try a HEAD request with a short timeout
-                $request = [System.Net.WebRequest]::Create($ServiceUrl)
-                $request.Method = "HEAD"
-                $request.Timeout = 5000 # 5 seconds timeout
-                $request.GetResponse().Close()
+                # Create a WebRequest with default proxy
+                $request = [System.Net.WebRequest]::Create($testUrl)
+                $request.Method = "GET"
+                $request.Timeout = 10000 # 10 seconds
+                $request.UserAgent = "PowerShell-PasswordGenerator"
+                
+                # Set proxy and credentials
+                $request.Proxy = [System.Net.WebRequest]::DefaultWebProxy
+                $request.Proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+                
+                # Get the response
+                $webResponse = $request.GetResponse()
+                $webResponse.Close()
+                
+                $controls.LogOutput.AppendText("HIBP API is available`n")
                 return $true
             }
             catch {
-                # Log the error but don't fail yet - the ping test passed
-                Write-Debug "HTTP check failed: $_"
-                # Still return true since the ping test passed
-                return $true
+                $controls.LogOutput.AppendText("HIBP API is not available: $($_.Exception.Message)`n")
+                return $false
             }
         }
-        
-        return $result
+        # For Password Pusher API, also use a direct GET request approach
+        elseif ($ServiceUrl -like "*pwpush.com*") {
+            $controls.LogOutput.AppendText("Testing Password Pusher API availability with a direct GET request`n")
+            
+            # Use a direct GET request to the main website instead of the API endpoint
+            # This is more reliable as the main site should always respond to GET requests
+            $testUrl = "https://pwpush.com"
+            
+            try {
+                # Create a WebRequest with default proxy
+                $request = [System.Net.WebRequest]::Create($testUrl)
+                $request.Method = "GET"
+                $request.Timeout = 10000 # 10 seconds
+                $request.UserAgent = "PowerShell-PasswordGenerator"
+                
+                # Set proxy and credentials
+                $request.Proxy = [System.Net.WebRequest]::DefaultWebProxy
+                $request.Proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+                
+                # Get the response
+                $webResponse = $request.GetResponse()
+                $webResponse.Close()
+                
+                $controls.LogOutput.AppendText("Password Pusher API is available`n")
+                return $true
+            }
+            catch {
+                $controls.LogOutput.AppendText("Password Pusher API is not available: $($_.Exception.Message)`n")
+                return $false
+            }
+        }
+        # For GitHub API, also use a direct GET request approach to handle corporate proxies
+        elseif ($ServiceUrl -like "*api.github.com*") {
+            $controls.LogOutput.AppendText("Testing GitHub API availability with a direct GET request`n")
+            
+            # Use a direct GET request to the API endpoint
+            # This is more reliable than ping tests which are often blocked by corporate proxies
+            $testUrl = "https://api.github.com"
+            
+            try {
+                # Create a WebRequest with default proxy
+                $request = [System.Net.WebRequest]::Create($testUrl)
+                $request.Method = "GET"
+                $request.Timeout = 10000 # 10 seconds
+                $request.UserAgent = "PowerShell-PasswordGenerator"
+                
+                # Add Accept header for GitHub API
+                $request.Accept = "application/vnd.github.v3+json"
+                
+                # Set proxy and credentials
+                $request.Proxy = [System.Net.WebRequest]::DefaultWebProxy
+                $request.Proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+                
+                # Get the response
+                $webResponse = $request.GetResponse()
+                $webResponse.Close()
+                
+                $controls.LogOutput.AppendText("GitHub API is available`n")
+                return $true
+            }
+            catch {
+                $controls.LogOutput.AppendText("GitHub API is not available: $($_.Exception.Message)`n")
+                return $false
+            }
+        }
+        else {
+            # For other services, use the original method
+            # Extract the hostname from the URL
+            $uri = [System.Uri]$ServiceUrl
+            $hostname = $uri.Host
+
+            # Try to resolve the hostname and check connectivity
+            $result = Test-Connection -ComputerName $hostname -Count 1 -Quiet
+            
+            # If Test-Connection succeeds, try a more direct HTTP check
+            if ($result) {
+                try {
+                    # Try a HEAD request with a short timeout
+                    $request = [System.Net.WebRequest]::Create($ServiceUrl)
+                    $request.Method = "HEAD"
+                    $request.Timeout = 5000 # 5 seconds timeout
+                    $request.GetResponse().Close()
+                    return $true
+                }
+                catch {
+                    # Log the error but don't fail yet - the ping test passed
+                    Write-Debug "HTTP check failed: $_"
+                    # Still return true since the ping test passed
+                    return $true
+                }
+            }
+            
+            return $result
+        }
     }
     catch {
+        $controls.LogOutput.AppendText("Error checking service availability: $($_.Exception.Message)`n")
         return $false
     }
 }
@@ -1647,11 +3499,19 @@ function Push-Password {
                         <ComboBoxItem Content="Swedish"/>
                     </ComboBox>
                     <TextBlock Grid.Column="5" Text="Presets:" VerticalAlignment="Center" Margin="10,0,10,0" Visibility="{Binding ElementName=RandomPasswordType, Path=IsChecked, Converter={StaticResource BooleanToVisibilityConverter}}"/>
-                    <ComboBox Grid.Column="6" x:Name="PasswordPresets" Width="150" HorizontalAlignment="Right" SelectedIndex="1" Visibility="{Binding ElementName=RandomPasswordType, Path=IsChecked, Converter={StaticResource BooleanToVisibilityConverter}}">
-                        <ComboBoxItem Content="Medium Password"/>
-                        <ComboBoxItem Content="Strong Password"/>
-                        <ComboBoxItem Content="Very Strong Password"/>
-                    </ComboBox>
+                    <Grid Grid.Column="6" Visibility="{Binding ElementName=RandomPasswordType, Path=IsChecked, Converter={StaticResource BooleanToVisibilityConverter}}">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <ComboBox Grid.Column="0" x:Name="PasswordPresets" Width="150" HorizontalAlignment="Left" SelectedIndex="1">
+                            <ComboBoxItem Content="Medium Password"/>
+                            <ComboBoxItem Content="Strong Password"/>
+                            <ComboBoxItem Content="Very Strong Password"/>
+                        </ComboBox>
+                        <Button Grid.Column="1" x:Name="PresetsSettingsButton" Content="(...)" Width="40" Height="24" Margin="5,0,0,0" 
+                                ToolTip="Manage Password Presets" Background="#0078D7" Foreground="White" FontWeight="Normal" FontSize="12"/>
+                    </Grid>
                 </Grid>
                 
                 <!-- Password Length/Word Count -->
@@ -1863,7 +3723,7 @@ function Push-Password {
                             <StackPanel Margin="10,0,0,15">
                                 <TextBlock Text="- Random or memorable password generation" TextWrapping="Wrap" Margin="0,2,0,2"/>
                                 <TextBlock Text="- Customizable password length and complexity" TextWrapping="Wrap" Margin="0,2,0,2"/>
-                                <TextBlock Text="- Predefined password presets for different security levels" TextWrapping="Wrap" Margin="0,2,0,2"/>
+                                <TextBlock Text="- Predefined and custom password presets for different security levels" TextWrapping="Wrap" Margin="0,2,0,2"/>
                                 <TextBlock Text="- Password strength assessment with entropy calculation" TextWrapping="Wrap" Margin="0,2,0,2"/>
                                 <TextBlock Text="- NATO and Swedish phonetic pronunciation support" TextWrapping="Wrap" Margin="0,2,0,2"/>
                                 <TextBlock Text="- Have I Been Pwned database integration" TextWrapping="Wrap" Margin="0,2,0,2"/>
@@ -1927,14 +3787,18 @@ function Push-Password {
                                     <TextBlock Text="onlyalex1984"/>
                                 </StackPanel>
                                 
-                                <StackPanel Orientation="Horizontal">
-                                    <TextBlock Text="Version: " FontWeight="SemiBold"/>
-                                    <TextBlock x:Name="VersionText" Text="1.0"/>
-                                </StackPanel>
+                            <StackPanel Orientation="Horizontal" Margin="0,5,0,0">
+                                <TextBlock Text="Version: " FontWeight="SemiBold"/>
+                                <TextBlock x:Name="VersionText" Text="1.0"/>
+                            </StackPanel>
                             </StackPanel>
                             
-                            <Button x:Name="GitHubButton" Grid.Column="1" Content="Project on GitHub" Width="150" Height="30"
-                                    Background="#0078D7" Foreground="White" Padding="5,3" VerticalAlignment="Center"/>
+                            <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right">
+                                <Button x:Name="CheckForUpdatesButton" Content="Check for Updates" Width="90" Height="22"
+                                        Background="#0078D7" Foreground="White" Padding="2,1" FontSize="10" Margin="0,0,10,0"/>
+                                <Button x:Name="GitHubButton" Content="Project on GitHub" Width="90" Height="22"
+                                        Background="#0078D7" Foreground="White" Padding="2,1" FontSize="10"/>
+                            </StackPanel>
                         </Grid>
                     </Border>
                 </Grid>
@@ -1962,11 +3826,12 @@ if ($versionText) {
 }
 
 # Reference UI controls for event handling
-$controls = @{
+$global:controls = @{
     RandomPasswordType = $window.FindName("RandomPasswordType")
     MemorablePasswordType = $window.FindName("MemorablePasswordType")
     LanguageSelector = $window.FindName("LanguageSelector")
     PasswordPresets = $window.FindName("PasswordPresets")
+    PresetsSettingsButton = $window.FindName("PresetsSettingsButton")
     PasswordLength = $window.FindName("PasswordLength")
     PasswordLengthValue = $window.FindName("PasswordLengthValue")
     WordCount = $window.FindName("WordCount")
@@ -1998,6 +3863,7 @@ $controls = @{
     CopyUrlButton = $window.FindName("CopyUrlButton")
     OpenInBrowserButton = $window.FindName("OpenInBrowserButton")
     LogOutput = $window.FindName("LogOutput")
+    CheckForUpdatesButton = $window.FindName("CheckForUpdatesButton")
 }
 
 # Applies light theme styling to UI elements
@@ -2505,32 +4371,28 @@ $controls.OpenInBrowserButton.Add_Click({
 })
 
 # Handles password preset selection changes
-$controls.PasswordPresets.Add_SelectionChanged({
-    $selectedPreset = $controls.PasswordPresets.SelectedItem.Content
+$global:controls.PasswordPresets.Add_SelectionChanged({
+    $selectedItem = $global:controls.PasswordPresets.SelectedItem
     
-    # Set all checkboxes to checked for all presets
-    $controls.IncludeUppercase.IsChecked = $true
-    $controls.IncludeNumbers.IsChecked = $true
-    $controls.IncludeSpecial.IsChecked = $true
+    # Get the preset object from the selected item's Tag property
+    $preset = $selectedItem.Tag
     
-    # Adjust password length based on the selected preset
-    switch ($selectedPreset) {
-        "Medium Password" {
-            $controls.PasswordLength.Value = 10
-            $controls.LogOutput.AppendText("Applied Medium Password preset (10 characters, uppercase, numbers, special)`n")
-        }
-        "Strong Password" {
-            $controls.PasswordLength.Value = 15
-            $controls.LogOutput.AppendText("Applied Strong Password preset (15 characters, uppercase, numbers, special)`n")
-        }
-        "Very Strong Password" {
-            $controls.PasswordLength.Value = 20
-            $controls.LogOutput.AppendText("Applied Very Strong Password preset (20 characters, uppercase, numbers, special)`n")
-        }
+    if ($preset) {
+        # Update UI controls based on the preset's properties
+        $global:controls.PasswordLength.Value = $preset.Length
+        $global:controls.IncludeUppercase.IsChecked = $preset.IncludeUppercase
+        $global:controls.IncludeNumbers.IsChecked = $preset.IncludeNumbers
+        $global:controls.IncludeSpecial.IsChecked = $preset.IncludeSpecial
+        
+        $global:controls.LogOutput.AppendText("Applied preset: $($preset.Name)`n")
+        $global:controls.LogOutput.AppendText("  - Length: $($preset.Length)`n")
+        $global:controls.LogOutput.AppendText("  - Uppercase: $($preset.IncludeUppercase)`n")
+        $global:controls.LogOutput.AppendText("  - Numbers: $($preset.IncludeNumbers)`n")
+        $global:controls.LogOutput.AppendText("  - Special: $($preset.IncludeSpecial)`n")
+        
+        # Generate a new password with the updated settings
+        New-Password
     }
-    
-    # Generate a new password with the updated settings
-    New-Password
 })
 
 # GitHub button click handler
@@ -2656,6 +4518,69 @@ $controls.GeneratedPassword.Add_TextChanged({
     Measure-CustomPassword -Password $securePassword
 })
 
+# Check for Updates button click handler
+$checkForUpdatesButton = $window.FindName("CheckForUpdatesButton")
+$checkForUpdatesButton.Add_Click({
+    $global:controls.LogOutput.AppendText("Checking for updates...`n")
+
+    # Show a progress indicator
+    $global:controls.CheckForUpdatesButton.IsEnabled = $false
+    $global:controls.CheckForUpdatesButton.Content = "Checking..."
+
+    try {
+        # Get update information
+        $updateInfo = Get-UpdateInformation
+
+        # Reset button state
+        $global:controls.CheckForUpdatesButton.IsEnabled = $true
+        $global:controls.CheckForUpdatesButton.Content = "Check for Updates"
+
+        # Check if there was an error with the update check
+        if ($null -eq $updateInfo) {
+            [System.Windows.MessageBox]::Show(
+                "Unable to check for updates. Please check your internet connection and try again.",
+                "Update Check Failed",
+                [System.Windows.MessageBoxButton]::OK,
+                [System.Windows.MessageBoxImage]::Warning
+            )
+            return
+        }
+        
+        # Check if there's an error message in the update info
+        if ($updateInfo.Error) {
+            [System.Windows.MessageBox]::Show(
+                "Cannot connect to GitHub: $($updateInfo.Error)`n`nPlease check your internet connection or proxy settings and try again.",
+                "Update Check Failed",
+                [System.Windows.MessageBoxButton]::OK,
+                [System.Windows.MessageBoxImage]::Warning
+            )
+            return
+        }
+
+        # Show update dialog only if we have valid update information
+        $dialogResult = Show-UpdateDialog -UpdateInfo $updateInfo
+
+        # Process update if user confirmed
+        if ($dialogResult.Result -eq $true) {
+            $releaseType = $dialogResult.ReleaseType
+            Invoke-Update -ReleaseType $releaseType
+        }
+    }
+    catch {
+        # Reset button state
+        $global:controls.CheckForUpdatesButton.IsEnabled = $true
+        $global:controls.CheckForUpdatesButton.Content = "Check for Updates"
+
+        $global:controls.LogOutput.AppendText("Error checking for updates: $($_.Exception.Message)`n")
+        [System.Windows.MessageBox]::Show(
+            "An error occurred while checking for updates: $($_.Exception.Message)",
+            "Update Check Error",
+            [System.Windows.MessageBoxButton]::OK,
+            [System.Windows.MessageBoxImage]::Error
+        )
+    }
+})
+
 # Window loaded event to ensure visibility
 $window.Add_Loaded({
     # Set window as topmost to bring it to the front
@@ -2664,7 +4589,26 @@ $window.Add_Loaded({
     $window.Activate()
     # Revert topmost setting to allow normal behavior
     $window.Topmost = $false
+    
+    # Load custom presets on startup
+    Import-PasswordPresets
+    $global:controls.LogOutput.AppendText("Loaded custom presets on startup`n")
+    
+    # Debug: Check if PresetsSettingsButton exists
+    if ($global:controls.PresetsSettingsButton) {
+        $global:controls.LogOutput.AppendText("PresetsSettingsButton found in controls`n")
+    } else {
+        $global:controls.LogOutput.AppendText("ERROR: PresetsSettingsButton not found in controls!`n")
+    }
+    
+    # Add settings button click handler here, after controls are fully initialized
+    $global:controls.PresetsSettingsButton.Add_Click({
+        $global:controls.LogOutput.AppendText("Settings button clicked`n")
+        Show-PasswordPresets
+        $global:controls.LogOutput.AppendText("Opened password presets management window`n")
+    })
 })
 
 # Display application window
 $window.ShowDialog() | Out-Null
+        $selectedWords += $word

@@ -636,44 +636,76 @@ function Test-InternetConnectivity {
         
         Write-Log "Checking connectivity to: $hostname" -Level "INFO" -ShowInConsole $false
         
-        # Try to resolve the hostname and check connectivity
-        $pingResult = Test-Connection -ComputerName $hostname -Count 1 -Quiet
-        
-        # If Test-Connection succeeds, try a more direct HTTP check
-        if ($pingResult) {
-            Write-Log "Ping test successful for: $hostname" -Level "INFO" -ShowInConsole $false
+        # Use a direct HTTP request approach (proxy-friendly)
+        try {
+            # Create a WebRequest with default proxy settings
+            $request = [System.Net.WebRequest]::Create($ServiceUrl)
+            $request.Method = "GET"
+            $request.Timeout = 10000 # 10 seconds timeout
+            $request.UserAgent = "PowerShell-Installer"
+            
+            # Set proxy and credentials
+            $request.Proxy = [System.Net.WebRequest]::DefaultWebProxy
+            $request.Proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+            
+            Write-Log "Attempting HTTP GET request to: $ServiceUrl" -Level "INFO" -ShowInConsole $false
+            
             try {
-                # Try a HEAD request with a short timeout
-                $request = [System.Net.WebRequest]::Create($ServiceUrl)
-                $request.Method = "HEAD"
-                $request.Timeout = 5000 # 5 seconds timeout
-                Write-Log "Attempting HTTP HEAD request to: $ServiceUrl" -Level "INFO" -ShowInConsole $false
-                
-                try {
-                    $response = $request.GetResponse()
-                    Write-Log "Successfully connected to $ServiceUrl (HTTP Status: $($response.StatusCode))" -Level "INFO" -ShowInConsole $false
-                    return $true
-                }
-                finally {
-                    # Dispose of the response if it exists
-                    if ($null -ne $response) {
-                        Write-Log "Disposing HTTP response" -Level "INFO"
-                        $response.Dispose()
-                    }
-                }
-            }
-            catch {
-                # Log the error but don't fail yet - the ping test passed
-                Write-Log "HTTP check failed: $_" -Level "WARNING"
-                # Still return true since the ping test passed
+                # Get the response
+                $response = $request.GetResponse()
+                Write-Log "Successfully connected to $ServiceUrl (HTTP Status: $($response.StatusCode))" -Level "INFO" -ShowInConsole $false
                 return $true
             }
+            finally {
+                # Dispose of the response if it exists
+                if ($null -ne $response) {
+                    Write-Log "Disposing HTTP response" -Level "INFO"
+                    $response.Dispose()
+                }
+            }
         }
-        else {
-            Write-Log "Ping check failed for: $hostname" -Level "WARNING"
+        catch {
+            Write-Log "HTTP request failed: $_" -Level "WARNING"
+            
+            # Try a fallback approach with Invoke-WebRequest
+            try {
+                Write-Log "Attempting fallback with Invoke-WebRequest..." -Level "INFO" -ShowInConsole $false
+                $webRequestParams = @{
+                    Uri = $ServiceUrl
+                    Method = "GET"
+                    UseBasicParsing = $true
+                    TimeoutSec = 10
+                    ErrorAction = "Stop"
+                }
+                
+                $null = Invoke-WebRequest @webRequestParams
+                Write-Log "Fallback request succeeded" -Level "INFO" -ShowInConsole $false
+                return $true
+            }
+            catch {
+                Write-Log "Fallback request failed: $_" -Level "WARNING"
+                
+                # As a last resort, try a ping test
+                # This might not work in corporate environments but we'll try anyway
+                try {
+                    Write-Log "Attempting ping test as last resort..." -Level "INFO" -ShowInConsole $false
+                    $pingResult = Test-Connection -ComputerName $hostname -Count 1 -Quiet
+                    
+                    if ($pingResult) {
+                        Write-Log "Ping test successful" -Level "INFO" -ShowInConsole $false
+                        return $true
+                    }
+                    else {
+                        Write-Log "Ping test failed" -Level "WARNING"
+                    }
+                }
+                catch {
+                    Write-Log "Ping test error: $_" -Level "WARNING"
+                }
+                
+                return $false
+            }
         }
-        
-        return $pingResult
     }
     catch {
         Write-Log "Error testing internet connectivity: $_" -Level "ERROR"
@@ -904,13 +936,14 @@ function Expand-ZipFile {
                     $ExistingFiles = ($ExistingItems | Where-Object { -not $_.PSIsContainer }).Count
                     Write-Log "Items to remove: $ExistingDirs directories and $ExistingFiles files" -Level "INFO" -ShowInConsole $false
                     
-                try {
-                    # Exclude the log file when cleaning the destination directory
-                    $LogFileName = Split-Path -Leaf $Config.LogPath
-                    Get-ChildItem -Path $DestinationPath -Force | 
-                        Where-Object { $_.Name -ne $LogFileName } | 
-                        Remove-Item -Recurse -Force
-                    Write-Log "Successfully cleaned destination directory (preserved log file)" -Level "INFO" -ShowInConsole $false
+            try {
+                # Exclude the log file and presets.json when cleaning the destination directory
+                $LogFileName = Split-Path -Leaf $Config.LogPath
+                $PresetsFileName = "presets.json"
+                Get-ChildItem -Path $DestinationPath -Force | 
+                    Where-Object { $_.Name -ne $LogFileName -and $_.Name -ne $PresetsFileName } | 
+                    Remove-Item -Recurse -Force
+                Write-Log "Successfully cleaned destination directory (preserved log file and presets)" -Level "INFO" -ShowInConsole $false
                 } catch {
                     Write-Log "Error cleaning destination directory: $_" -Level "WARNING"
                     # Continue despite cleaning failure
@@ -2713,10 +2746,22 @@ if ($Success) {
     }
     
     Show-CompletionMessage -Success $true -ScriptPath $ScriptPath
+    
+    # Add a brief pause before exiting to allow user to see the completion message
+    Write-Host ""
+    Write-Host "Installation completed successfully. Exiting in 3 seconds..." -ForegroundColor Green
+    Start-Sleep -Seconds 3
+    
     exit 0
 }
 else {
     Show-CompletionMessage -Success $false
+    
+    # Add a brief pause before exiting to allow user to see the error message
+    Write-Host ""
+    Write-Host "Installation failed. Exiting in 3 seconds..." -ForegroundColor Red
+    Start-Sleep -Seconds 3
+    
     exit 1
 }
 #endregion
